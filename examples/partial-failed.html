@@ -1,0 +1,36 @@
+<!doctype html><html lang="zh"><meta charset="utf-8"><title>多机任务报告</title><style>body{font:16px sans-serif;max-width:1200px;margin:36px auto}table{border-collapse:collapse}td,th{border:1px solid #bbb;padding:8px}pre{white-space:pre-wrap}</style><h1>任务 demo</h1><p>本轮任务部分完成：已到达1/2点；仍有跳点、能力不足或结果未知</p><p>完成点数依据导航成功到达，不代表挂载子任务全部执行成功。</p><pre>{
+  &quot;mission_id&quot;: &quot;demo&quot;,
+  &quot;round_epoch&quot;: 1,
+  &quot;state&quot;: &quot;FAILED&quot;,
+  &quot;plan_revision&quot;: 2,
+  &quot;message&quot;: &quot;本轮任务部分完成：已到达1/2点；仍有跳点、能力不足或结果未知&quot;,
+  &quot;total_tasks&quot;: 2,
+  &quot;completed_tasks&quot;: 1,
+  &quot;unfinished_tasks&quot;: 1,
+  &quot;retry_performed&quot;: true,
+  &quot;retry_limit&quot;: 1,
+  &quot;unconfirmed_tasks&quot;: {},
+  &quot;unassignable_tasks&quot;: {},
+  &quot;skipped_tasks&quot;: [
+    &quot;p1&quot;
+  ],
+  &quot;commit_index&quot;: 20
+}</pre><table><tr><th>整轮点号</th><th>原始ID</th><th>状态</th><th>设备</th><th>挂载操作</th><th>原因</th></tr><tr><td>1</td><td>p0</td><td>COMPLETED</td><td>R0</td><td>纯导航</td><td></td></tr><tr><td>2</td><td>p1</td><td>SKIPPED</td><td>R0</td><td>纯导航</td><td></td></tr></table><h2>提交时间线</h2><ol><li>#2 MISSION / PREPARING </li>
+<li>#3 ACTIVATE / PLANNING </li>
+<li>#4 PLAN / PLANNED </li>
+<li>#5 PREPARED / PLANNED </li>
+<li>#6 PREPARED / PLANNED </li>
+<li>#7 START / ACTIVE </li>
+<li>#8 STARTED / ACTIVE </li>
+<li>#9 STARTED / ACTIVE </li>
+<li>#10 RESULT / ACTIVE </li>
+<li>#11 PAUSE / PAUSING 整轮唯一一次最终跳点补执行</li>
+<li>#12 REPLAN / PLANNING </li>
+<li>#13 PLAN / PLANNED </li>
+<li>#14 PREPARED / PLANNED </li>
+<li>#15 PREPARED / PLANNED </li>
+<li>#16 START / ACTIVE </li>
+<li>#17 STARTED / ACTIVE </li>
+<li>#18 STARTED / ACTIVE </li>
+<li>#19 RESULT / ACTIVE </li>
+<li>#20 FINISH / FAILED 本轮任务部分完成：已到达1/2点；仍有跳点、能力不足或结果未知</li></ol><h2>图片证据</h2><p>尚无已同步的图片；不影响导航到达判据。</p><script type="application/json" id="swarm-media-manifest">[]</script></html>
