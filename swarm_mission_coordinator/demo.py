@@ -56,17 +56,19 @@ def main():
         )
     )
     for robot in robots:
+        status = root / (robot + "-status.json")
+        status.write_text(json.dumps({"capabilities": ["device"], "nominal_speed_mps": 1.0}))
         config = {
-            "robot_id": robot,
-            "cluster_id": "local-demo",
-            "data_root": str(root / "runtime"),
-            "transport": {
-                "mqtt_host": "127.0.0.1",
-                "platform_prefix": "fh/swarm/dev/dispatch",
+            "modules": {name: False for name in ("task_hub", "sensor_gimbal", "charge", "sensors", "mqtt", "algorithm_transport")},
+            "mqtt": {"host": "127.0.0.1", "port": 1883},
+            "cooperation": {
+                "mode": "swarm", "robot_id": robot, "device_status_path": str(status),
+                "swarm": {
+                    "cluster_id": "local-demo", "data_root": str(root / "runtime"),
+                    "footprint_radius": 0.1,
+                    "agent": {"task_hub_prefix": "/swarm/mock"},
+                },
             },
-            "agent": {"allow_motion": True, "task_hub_prefix": "/swarm/mock"},
-            "planner": {"footprint_radius": 0.1},
-            "coordinator": {"footprint_radius": 0.1},
         }
         (root / (robot + ".yaml")).write_text(yaml.safe_dump(config))
     print(str(root / "mission.json"))

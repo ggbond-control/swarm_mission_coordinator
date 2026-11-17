@@ -13,8 +13,6 @@ setup(
             "share/" + name,
             ["package.xml", "README.md", "TEST_LOG.md"] + glob("PROTOCOL.md"),
         ),
-        ("share/" + name + "/launch", glob("launch/*.launch.py")),
-        ("share/" + name + "/config", glob("config/*.yaml")),
         (
             "share/" + name + "/examples",
             glob("examples/*.html") + glob("examples/*.json"),

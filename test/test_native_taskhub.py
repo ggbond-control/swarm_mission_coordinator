@@ -181,7 +181,7 @@ def test_native_taskhub_navigation_skip_and_single_fallback(tmp_path, failures):
         (
             "agent",
             "swarm_execution_agent",
-            {"robot_id": "R0", "allow_motion": True, "task_hub_prefix": ""},
+            {"robot_id": "R0", "task_hub_prefix": ""},
         ),
         (
             "coordinator",

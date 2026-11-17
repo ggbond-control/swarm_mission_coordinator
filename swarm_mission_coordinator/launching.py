@@ -1,19 +1,15 @@
-"""New-stack launch only. Does not start TaskHub, navigation or legacy packages."""
+"""ROS launch actions from an already merged device configuration."""
 
 from pathlib import Path
 
-import yaml
-from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, OpaqueFunction, SetEnvironmentVariable
-from launch.substitutions import LaunchConfiguration
+from launch.actions import GroupAction, SetEnvironmentVariable
 from launch_ros.actions import Node
 from swarm_protocol.contracts import identifier
+from swarm_protocol.topics import DEFAULT_CLUSTER_ID
 
 
-def start(context):
-    path = LaunchConfiguration("config").perform(context)
-    with open(path) as stream:
-        config = yaml.safe_load(stream)
+def device_nodes(config):
+    """Build the five device-local nodes; Bringup owns configuration loading."""
     robot = identifier(config["robot_id"], "robot_id")
     root = Path(config.get("data_root", "~/.ros/swarm")).expanduser() / robot
     nodes = [SetEnvironmentVariable("ROS_LOG_DIR", str(root / "ros_logs"))]
@@ -32,7 +28,7 @@ def start(context):
         if section == "coordinator":
             params["agent_data_root"] = str(root / "agent")
         if section in {"transport", "coordinator"}:
-            params["cluster_id"] = config.get("cluster_id", "swarm-local")
+            params["cluster_id"] = config.get("cluster_id", DEFAULT_CLUSTER_ID)
         nodes.append(
             Node(
                 package=package,
@@ -41,15 +37,4 @@ def start(context):
                 parameters=[params],
             )
         )
-    return nodes
-
-
-def generate_launch_description():
-    return LaunchDescription(
-        [
-            DeclareLaunchArgument(
-                "config", description="Explicit standalone swarm device YAML"
-            ),
-            OpaqueFunction(function=start),
-        ]
-    )
+    return [GroupAction(actions=nodes, scoped=True)]

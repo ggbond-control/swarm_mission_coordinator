@@ -1,4 +1,4 @@
-# 开发协议 v1
+# Swarm 协议约定
 
 协议用于新系列本地开发。生产主题 ACL、平台字段和实际 MinIO 约定须在切换前联调确认。
 
@@ -20,6 +20,8 @@
 Raft 通过 prevote、持久投票、日志新旧比较、当前任期提交及关联复制 ACK 维护权限。执行授权额外经过多数派 read barrier，不能仅凭 Leader 心跳或 MQTT PUBACK 续发。
 
 ## MQTT 主题
+
+日常配置只需选择 mode，默认内部前缀 `fh/swarm/peer`、集群 `inspection-swarm`、平台前缀 `fh/swarm/dispatch`；主题不含日期或协议版本。测试环境允许显式覆盖前缀和集群。消息中的协议版本用于拒绝不兼容节点，不随普通代码变更递增；TaskHub 快照版本独立维护。
 
 ```text
 <mqtt_prefix>/<cluster>/broadcast/<sender>
@@ -64,7 +66,7 @@ Agent 按本机 waypoint 到原始 task id 映射生成结果，可靠 outbox �
 
 ## 平台输出
 
-开发前缀默认 `fh/swarm/dev/dispatch`；services／services_reply／events／state 与设备 heartbeat 分开。外层保持 bid／tid／timestamp／method／data；事件带稳定 event_id、round_epoch、term、commit_index、revision。
+固定平台前缀 `fh/swarm/dispatch`；services／services_reply／events／state 与设备心跳 `fh/swarm/device/<robot_id>/heartbeat` 分开，不复用旧 fleet 主题。外层保持 bid／tid／timestamp／method／data；事件带稳定 event_id、round_epoch、term、commit_index、revision。
 
 | 类别 | 本版本用途 |
 | --- | --- |

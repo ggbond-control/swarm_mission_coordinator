@@ -2,7 +2,7 @@
 
 `swarm_*` 是设备端运行的全分布式协同开发版本（0.1）。每台设备保存任务副本，由具有固定多数派权限的 Leader 协调规划和执行。云端保留平台、MQTT Broker 和存储，运行任务时不需要云端调度 ROS 节点。
 
-当前交付用于本地模拟和接口开发。平台实际前后端、5G 网络、真实 MinIO 条件写入以及有人值守的运动验收尚未进行，不能直接替换现有演示部署。验证记录和复现命令见 [TEST_LOG.md](TEST_LOG.md)，设计依据见 [架构方案](../多机协同全分布式架构方案_部门评审稿.md)。
+当前交付已通过本地隔离测试及 CYVET-A／B 双机小规模纯导航测试。平台实际前后端、复杂多机运动、5G 故障注入和真实 MinIO 条件写入尚未验收，不能直接替换现有演示部署。验证记录和复现命令见 [TEST_LOG.md](TEST_LOG.md)，设计依据见 [架构方案](../多机协同全分布式架构方案_部门评审稿.md)。
 
 ## 模块
 
@@ -19,7 +19,7 @@
 
 `swarm_mission_coordinator` 是整套系统的启动与文档入口，因而保存总览、协议、配置和跨包集成记录。它在**每台设备**运行，不是固定中央主机；当前 Leader 才能提交决策。各包自己的 README／TEST_LOG 说明本包职责，并链接到统一集成记录。
 
-目录按职责组织：`launch/`、`config/` 负责启动，`examples/` 保存版本化报告和平台消息样例，`test/` 保存测试，内层同名 Python 目录保存运行代码。协调器内部 `model.py` 只应用已提交状态，`coordinator.py` 产生下一步提案，`node.py`／`api.py` 适配 ROS，`platform.py` 投影事件，`media.py` 管理图片，`reporting.py` 管理报告与后台任务，`storage_upload.py` 单独处理 S3 条件写入。
+目录按职责组织：`examples/` 保存版本化报告和平台消息样例，`test/` 保存测试，内层同名 Python 目录保存运行代码；设备配置及启动入口统一归 Bringup，本包不维护独立 `launch/`、`config/`。协调器内部 `model.py` 只应用已提交状态，`coordinator.py` 产生下一步提案，`node.py`／`api.py` 适配 ROS，`platform.py` 投影事件，`media.py` 管理图片，`reporting.py` 管理报告与后台任务，`storage_upload.py` 单独处理 S3 条件写入。
 
 ```mermaid
 flowchart LR
@@ -50,37 +50,45 @@ source install/setup.bash
 
 ## 启动配置
 
-独立设备配置示例为 [device.example.yaml](config/device.example.yaml)。先复制为设备自己的文件，设置 `robot_id`、集群和 MQTT；`robot_ids` 不写在设备配置中。
-
-```bash
-ros2 launch swarm_mission_coordinator swarm_device.launch.py config:=/绝对路径/device.yaml
-```
-
-该入口启动五个新节点，不启动导航、TaskHub 或原协同节点。默认 `allow_motion: false`，TaskHub 前缀 `/swarm/mock`，Broker 为本机，平台主题为独立开发主题。仅把 `allow_motion` 改为 true 仍不足以连接真实 TaskHub；真实接口需显式配置 `task_hub_prefix: ''`。
-
-Agent 检查本 ROS 域内的旧控制节点和重复服务提供者，存在冲突时拒绝发送控制。这个检查不是跨网络安全互锁；切换控制栈时仍须先停止原服务，确认设备已停止。
-
-通过统一 Bringup 启动时：
-
-```bash
-ros2 launch inspection_bringup inspection_system.launch.py \
-  cooperation_mode:=swarm swarm_config_path:=/绝对路径/device.yaml
-```
-
-也可在现有 `robot.yaml` 的 `system` 中增加：
+设备配置统一在 `inspection_bringup/config`，按 `system.yaml → models/<model>/system.yaml → robot.yaml` 合并。日常仅修改 `robot.yaml`：
 
 ```yaml
+model: cyvet
+robot_id: CYVET-A
 system:
   cooperation:
-    mode: swarm
-    config_path: /绝对路径/device.yaml
+    mode: swarm  # disabled | coordination | swarm
 ```
 
-默认模式仍为 legacy。swarm 模式禁用旧 Agent／planner／选举及 Bridge 的旧协同转发；显式同时启用旧 Agent 会报错。Bringup 仍按原模块配置启动其余组件；本地测试使用独立新入口及模拟 TaskHub，不使用这条整机启动命令。
+修改后执行 `inspection_bringup/scripts/manage_inspection_services.sh restart system`。协同模式没有命令行覆盖；旧模块开关、`config_path`、设备专用 swarm YAML 和 `allow_motion` 均已删除，旧配置明确报错。`disabled` 关闭所有协同节点和协同心跳，`coordination` 启动原半分布式三节点，`swarm` 启动五个新节点；普通平台设备状态、TaskHub 和导航按原模块配置运行。
+
+Bringup 从现有 `mqtt` 读取连接参数，从 `device_status.json` 读取能力及速度，从顶层 `robot_id` 取得身份，通过 ROS 参数字典分别传给五个节点。Coordinator 不自行读取 YAML，不维护第二套配置文件。`launching.py` 仅构造节点，不读取设备文件。默认连接真实 TaskHub，由已提交启动命令和多数派执行许可控制路线；不需要额外执行开关。未收到任务不会启动路线，但 Agent 启动时会取消旧路线以建立安全状态，切换前应先确认任务停止。
+
+模拟测试显式将 `cooperation.swarm.agent.task_hub_prefix` 配为 `/swarm/mock` 并启动对应 mock，使用独立 ROS 域与 MQTT 主题；它是测试接口映射，不是实机执行开关。独立启动节点也会接入真实 TaskHub，运行前须核对服务映射。
+
+`cooperation.swarm` 只需覆盖差异，未填写的选举与业务超时使用节点默认值。净空半径、空闲阈值在 `swarm.footprint_radius`、`swarm.free_thresh` 各配置一次，同时传给预检和 planner。`cooperation.coordination.agent.auto_execute` 仅保留原半分布式语义。TLS 相关配置复用 `mqtt.tls`、`mqtt.ca`；按实际连接设置使用 TLS 或明文，不需要额外明文许可开关。日常无需 `cooperation.swarm`，只有高级调试或隔离测试才覆盖。
+
+Agent 检查本 ROS 域的旧控制节点和重复服务提供者，存在冲突时拒绝控制；该检查不构成跨网络硬件互锁。模式默认 `disabled`，不会默认启用任何控制栈。
 
 ## 任务输入
 
-平台在配置的 `<platform_prefix>/services` 发布 `task.execute`：
+平台在固定主题 `fh/swarm/dispatch/services` 发布 `task.execute`，返回主题如下。全分布式不订阅原 `fh/fleet/dispatch/services`，不向原 fleet 心跳主题发送消息。
+
+| 用途 | 固定主题 |
+| --- | --- |
+| 平台请求 | `fh/swarm/dispatch/services` |
+| 请求应答 | `fh/swarm/dispatch/services_reply` |
+| 任务事件 | `fh/swarm/dispatch/events` |
+| 任务状态 | `fh/swarm/dispatch/state` |
+| 设备心跳 | `fh/swarm/device/<robot_id>/heartbeat` |
+| 设备内部广播 | `fh/swarm/peer/inspection-swarm/broadcast/<robot_id>` |
+| 设备内部定向 | `fh/swarm/peer/inspection-swarm/to/<recipient>/<sender>` |
+
+内部固定集群名为 `inspection-swarm`，只是消息隔离标识；本轮投票名单仍由平台 `robot_ids` 决定。主题和集群名不含日期或协议版本，不随普通代码升级改变。隔离测试可覆盖 `cooperation.swarm.cluster_id`、`mqtt_prefix`、`platform_prefix`；设备心跳保持上述固定主题，测试使用独立 Broker 或模拟设备身份。
+
+消息内容的内部 `protocol_version` 与 TaskHub 导航快照版本分别保留，只有不兼容协议变化才升级，不因普通修复而要求平台修改。
+
+请求示例：
 
 ```json
 {
@@ -172,7 +180,7 @@ HTML 图片内嵌。最近八轮历史模型用于迟到图片补充和原 key �
 
 默认数据根目录 `~/.ros/swarm/<robot_id>/`，共识、Agent、协调器和传输分别持有进程锁。原生 ROS 日志存入该设备数据目录的 `ros_logs`；协调器保留共识派生状态、报告、上传任务、图片及请求记录。
 
-六个包不会各自在源码目录生成一套 `runtime/` 和 `reports/`。统一 launch 和各节点独立启动的默认目录均按设备隔离；显式指定节点 `data_root` 时使用该目录本身，统一配置顶层 `data_root` 则由 launch 追加设备名和组件名。
+六个包不会各自在源码目录生成一套 `runtime/` 和 `reports/`。统一 Bringup 和各节点独立启动的默认目录均按设备隔离；显式指定节点 `data_root` 时使用该目录本身，Bringup 的 `cooperation.swarm.data_root` 则由 launch 追加设备名和组件名。
 
 | 默认目录（位于 `~/.ros/swarm/<robot_id>/`） | 内容 |
 | --- | --- |

@@ -73,7 +73,7 @@ class Device:
                 "swarm_execution_agent_node",
                 {
                     "robot_id": self.robot,
-                    "allow_motion": True,
+                    "task_hub_prefix": "/swarm/mock",
                     "nominal_speed": 1.0,
                     "permit_seconds": 5.0,
                 },
@@ -243,7 +243,7 @@ def local_fleet(tmp_path_factory):
             return False
 
     wait_for(connect, 10, "local broker startup")
-    client.subscribe("fh/swarm/dev/dispatch/#", qos=1)
+    client.subscribe("fh/#", qos=1)
     client.loop_start()
     devices = []
     try:
@@ -283,7 +283,7 @@ def submit(fleet, epoch, tasks=3):
     value["mission_id"] = f"local-{epoch}"
     value = {k: v for k, v in value.items() if k != "mission_id"}
     fleet["mqtt"].publish(
-        "fh/swarm/dev/dispatch/services",
+        "fh/swarm/dispatch/services",
         json.dumps(
             {
                 "method": "task.execute",
@@ -311,6 +311,13 @@ def finish_until(fleet, state="COMPLETED", timeout=35):
 
 def test_real_mqtt_ros_all_arrived(local_fleet):
     f = local_fleet
+    wait_for(
+        lambda: {item[0] for item in f["messages"]
+                 if item[0].startswith("fh/swarm/device/")} >= {
+                     f"fh/swarm/device/R{i}/heartbeat" for i in range(3)},
+        15, "all devices publish new swarm heartbeats",
+    )
+    assert not any("/fleet/" in topic for topic, _ in f["messages"])
     submit(f, 1)
     wait_for(
         lambda: any(d.state.get("state") == "ACTIVE" for d in f["devices"]),

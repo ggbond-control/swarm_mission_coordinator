@@ -24,6 +24,7 @@ from swarm_protocol.contracts import (
 )
 from swarm_protocol.ros import main_node, publish, runtime_path
 from swarm_protocol.storage import ProcessLock, atomic_json
+from swarm_protocol.topics import DEFAULT_CLUSTER_ID
 
 from inspection_interfaces.msg import PlatformEvent
 
@@ -40,7 +41,7 @@ class CoordinatorNode(Node):
         super().__init__("swarm_mission_coordinator")
         for key, value in [
             ("robot_id", ""),
-            ("cluster_id", "swarm-local"),
+            ("cluster_id", DEFAULT_CLUSTER_ID),
             ("phase_timeout", 30.0),
             ("planning_timeout", 60.0),
             ("offline_timeout", 10.0),
