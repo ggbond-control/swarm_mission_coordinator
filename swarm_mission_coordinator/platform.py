@@ -24,10 +24,12 @@ def message(model, term, stage, *, method="mission.events", index=None, **fields
     }
 
 
-def snapshot_events(model, term):
+def snapshot_events(model, term, *, after=0):
     """Replay stable identities after takeover; frontend must deduplicate event_id."""
     out = []
     for event in model.events:
+        if event["index"] <= after:
+            continue
         kind = event["kind"]
         fields = {"message": event["message"], "plan_revision": event["revision"]}
         stage = event["state"].lower()
@@ -38,17 +40,15 @@ def snapshot_events(model, term):
             stage = "planning"
         elif kind == "ADD":
             stage = "for_platform_tasks_added"
+            if "task_ids" in event:
+                fields["task_ids"] = event["task_ids"]
         elif kind == "PAUSE":
             stage = (
                 "for_platform_skipped_tasks" if event.get("fallback") else "pause_task"
             )
             if event.get("fallback"):
-                numbering = {
-                    t["id"]: n for n, t in enumerate(model.mission["tasks"], 1)
-                }
                 fields["skipped_tasks"] = [
-                    {"task_id": t, "task_number": numbering[t]}
-                    for t in event["skipped_tasks"]
+                    {"task_id": task_id} for task_id in event["skipped_tasks"]
                 ]
         elif kind == "EXCLUDE":
             stage = "device_isolated"
@@ -63,7 +63,7 @@ def snapshot_events(model, term):
         out.append(
             message(model, term, stage, method=method, index=event["index"], **fields)
         )
-    if model.state in {"COMPLETED", "FAILED", "CANCELLED"}:
+    if model.state in {"COMPLETED", "FAILED", "CANCELLED"} and model.terminal_index > after:
         for stage in ("for_platform_mission_finished", model.state):
             out.append(message(model, term, stage, index=model.terminal_index))
     return out

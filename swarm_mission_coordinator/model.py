@@ -364,6 +364,7 @@ class MissionState:
                 "state": self.state,
                 "message": c.get("reason", ""),
                 "fallback": bool(c.get("fallback")),
+                **({"task_ids": [task["id"] for task in c["tasks"]]} if kind == "ADD" else {}),
                 **(
                     {"routes": copy.deepcopy(self.assignments)}
                     if kind == "PLAN"
@@ -381,10 +382,17 @@ class MissionState:
             }
         )
 
+    def dependency_blockers(self, robot):
+        for predecessor in self.assignments[robot]["dependencies"]:
+            result = self.results.get(predecessor, {})
+            if result.get("finalized"):
+                final_task = self.assignments[predecessor]["task_ids"][-1:]
+                if result["state"] != "COMPLETED" or not set(final_task).issubset(result["reached"]):
+                    yield predecessor
+
     def dependencies_finished(self, robot):
-        return all(
+        return not any(self.dependency_blockers(robot)) and all(
             self.results.get(r, {}).get("finalized")
-            and self.results[r]["state"] == "COMPLETED"
             for r in self.assignments[robot]["dependencies"]
         )
 
@@ -436,14 +444,18 @@ class MissionState:
                 raise ValueError("stale/conflicting navigation evidence")
 
     def summary(self):
+        completed_ids = [task_id for task_id, status in self.tasks.items()
+                         if status == "COMPLETED"]
         return {
             "mission_id": self.mission.get("mission_id", ""),
+            "map_package": self.mission.get("map_package", ""),
             "round_epoch": self.epoch,
             "state": self.state,
             "plan_revision": self.revision,
             "message": self.reason,
             "total_tasks": len(self.tasks),
-            "completed_tasks": sum(s == "COMPLETED" for s in self.tasks.values()),
+            "completed_tasks": len(completed_ids),
+            "completed_task_ids": completed_ids,
             "unfinished_tasks": len(self.unfinished),
             "retry_performed": self.skip_retry_used,
             "retry_limit": 1,

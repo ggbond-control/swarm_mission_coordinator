@@ -4,14 +4,14 @@ from types import SimpleNamespace
 
 import pytest
 from swarm_mission_coordinator.model import MissionState
-from swarm_mission_coordinator.node import CoordinatorNode
+from swarm_mission_coordinator.ingress import MissionIngress
 
 
 class Ingress:
-    accept_request = CoordinatorNode.accept_request
-    request_control = CoordinatorNode.request_control
-    enqueue_request = CoordinatorNode.enqueue_request
-    forward_requests = CoordinatorNode.forward_requests
+    accept_request = MissionIngress.accept_request
+    request_control = MissionIngress.request_control
+    enqueue_request = MissionIngress.enqueue_request
+    forward_requests = MissionIngress.forward_requests
 
     def __init__(self, root, previous=False):
         model = MissionState()
@@ -74,3 +74,17 @@ def test_old_control_cannot_cancel_new_admission(tmp_path, envelope):
     with pytest.raises(ValueError):
         node.accept_request(envelope)
     assert not node.command_outbox and not node.sent
+
+
+def test_full_request_relay_stops_after_round_activation(tmp_path):
+    node = Ingress(tmp_path)
+    node.core.model.epoch = 2
+    node.core.model.state = "PREPARING"
+    node.relay = {"input": ({"data": {"round_epoch": 2, "robot_ids": ["A", "B"]}}, 120)}
+    forwarded = []
+    node.wire = lambda *args: forwarded.append(args)
+    node.forward_requests(2)
+    assert len(forwarded) == 1 and forwarded[0][:2] == ("B", "round_input")
+    node.core.model.state = "PLANNING"
+    node.forward_requests(4)
+    assert len(forwarded) == 1 and not node.relay

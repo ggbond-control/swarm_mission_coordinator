@@ -129,15 +129,19 @@ class MissionCluster:
             if r in self.net.crashed:
                 continue
             engine = self.net.nodes[r]
-            state = {
-                **engine.state(self.net.now),
-                "entries": engine.committed(),
-                "boot_id": engine.boot,
-            }
+            state = {**engine.state(self.net.now), "boot_id": engine.boot}
             core.receive_consensus(state)
-            for e in engine.committed():
-                if e["command"]["type"] == "EXCLUDE":
-                    engine.exclude(e["command"]["robot_id"])
+            while core.model.last_index < state["commit_index"]:
+                after = core.model.last_index
+                entries = engine.committed_batch(after)
+                assert core.receive_entries({
+                    "round_epoch": state["round_epoch"], "boot_id": engine.boot,
+                    "after": after, "entries": entries,
+                })
+                for entry in entries:
+                    command = entry["command"]
+                    if command["type"] == "EXCLUDE":
+                        engine.exclude(command["robot_id"])
             for p, info in robots.items():
                 if p in self.net.crashed:
                     continue

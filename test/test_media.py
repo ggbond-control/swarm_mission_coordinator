@@ -1,10 +1,12 @@
 import base64
 import time
+from types import SimpleNamespace
 
 import pytest
 from PIL import Image
 from support import MissionCluster
 from swarm_mission_coordinator.media import MediaStore
+from swarm_mission_coordinator.mission_evidence import MissionEvidence
 from swarm_mission_coordinator.reporting import render
 
 
@@ -49,3 +51,21 @@ def test_images_preserve_revision_and_reject_old_round_and_paths(tmp_path):
     finally:
         left.close()
         right.close()
+
+
+def test_media_manifest_omits_empty_rounds_and_current_history_duplicate():
+    current = SimpleNamespace(epoch=3, mission={"mission_id": "demo"})
+    history = {2: SimpleNamespace(epoch=2), 3: current}
+    records = {2: [], 3: []}
+    sent = []
+    evidence = SimpleNamespace(
+        core=SimpleNamespace(model=current), history=history,
+        media=SimpleNamespace(tick=lambda: None, manifest=lambda model: records[model.epoch]),
+        last_manifest=0, last_media=0, media_serving=[], media_manifests={},
+        wire=lambda *value: sent.append(value),
+    )
+    MissionEvidence.replicate_media(evidence, 10)
+    assert not sent
+    records[3] = [{"id": "photo"}]
+    MissionEvidence.replicate_media(evidence, 16)
+    assert sent == [("*", "media_manifest", {"records": [{"id": "photo"}]})]

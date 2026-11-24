@@ -3,6 +3,8 @@
 import copy
 import hashlib
 import json
+import os
+import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -17,7 +19,7 @@ from .storage_upload import conditional_upload
 def render(model, images=()):
     summary = model.summary()
     rows = []
-    for number, task in enumerate(model.mission["tasks"], 1):
+    for task in model.mission["tasks"]:
         identity = task["id"]
         reason = (
             model.unknown.get(identity, {}) or model.unassignable.get(identity, {})
@@ -28,7 +30,6 @@ def render(model, images=()):
             + "".join(
                 "<td>" + escape(str(v)) + "</td>"
                 for v in (
-                    number,
                     identity,
                     model.tasks[identity],
                     model.owners.get(identity, ""),
@@ -65,7 +66,7 @@ def render(model, images=()):
         f"<h1>任务 {escape(model.mission['mission_id'])}</h1><p>{escape(model.reason)}</p>"
         "<p>完成点数依据导航成功到达，不代表挂载子任务全部执行成功。</p>"
         f"<pre>{escape(json.dumps(summary, ensure_ascii=False, indent=2))}</pre>"
-        "<table><tr><th>整轮点号</th><th>原始ID</th><th>状态</th><th>设备</th><th>挂载操作</th><th>原因</th></tr>"
+        "<table><tr><th>任务点 ID</th><th>状态</th><th>设备</th><th>挂载操作</th><th>原因</th></tr>"
         + "".join(rows)
         + f"</table><h2>提交时间线</h2><ol>{timeline}</ol><h2>图片证据</h2>"
         + (gallery or "<p>尚无已同步的图片；不影响导航到达判据。</p>")
@@ -75,9 +76,22 @@ def render(model, images=()):
     ).encode()
 
 
+def write_html(path, content):
+    fd, name = tempfile.mkstemp(dir=path.parent, prefix=".report-")
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(name, path)
+    finally:
+        Path(name).unlink(missing_ok=True)
+
+
 class ReportWorker:
-    def __init__(self, root, logger, upload=conditional_upload):
+    def __init__(self, root, logger, upload=conditional_upload, *, job_root=None):
         self.root, self.logger, self.upload = Path(root), logger, upload
+        self.job_root = Path(job_root) if job_root is not None else self.root
         self.pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="swarm-report")
         self.generation_pool = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="swarm-report-generation"
@@ -88,7 +102,7 @@ class ReportWorker:
         self.lock = threading.Lock()
         self.running = False
         self.closed = False
-        for path in self.root.glob("*/job.json"):
+        for path in self.job_root.glob("*/job.json"):
             try:
                 job = json.loads(path.read_text())
                 if job["status"] not in {"succeeded", "failed"}:
@@ -109,6 +123,7 @@ class ReportWorker:
             previous = self.generation
             self.generation = None
             previous.result()  # caller logs failure independently of control
+        signature += (bool(storage),)
         if signature == self.generated_signatures.get(model.epoch):
             return
         model = copy.deepcopy(model)
@@ -128,6 +143,7 @@ class ReportWorker:
         folder = self.root / f"round-{model.epoch}"
         folder.mkdir(parents=True, exist_ok=True)
         path = folder / (model.mission["mission_id"] + ".html")
+        folder = self.job_root / f"round-{model.epoch}"
         version = model.terminal_index
         content = render(model, images)
         content_digest = hashlib.sha256(content).hexdigest()
@@ -145,11 +161,11 @@ class ReportWorker:
                     or disk_job.get("content_digest") == content_digest
                 ):
                     return path
-            path.write_bytes(content)
+            write_html(path, content)
             if storage:
                 atomic_json(folder / "credentials.json", storage)
                 snapshot = folder / ("upload-" + content_digest + ".html")
-                snapshot.write_bytes(content)
+                write_html(snapshot, content)
                 job = {
                     "epoch": model.epoch,
                     "version": version,
@@ -166,7 +182,9 @@ class ReportWorker:
         self.logger.info(f"报告已生成：round={model.epoch} path={path}")
         return path
 
-    def tick(self):
+    def tick(self, *, authorized=lambda: True):
+        if not authorized():
+            return
         with self.lock:
             if self.running or self.closed:
                 return
@@ -182,21 +200,33 @@ class ReportWorker:
             job["status"] = "uploading"
             atomic_json(Path(folder) / "job.json", job)
             self.running = True
-        self.pool.submit(self._run, folder, job.copy())
+        self.pool.submit(self._run, folder, job.copy(), authorized)
 
-    def _run(self, folder, job):
+    def _run(self, folder, job, authorized):
         try:
+            if not authorized():
+                job["status"] = "pending"
+                return
             storage = json.loads((Path(folder) / "credentials.json").read_text())
             self.logger.info(
                 f"报告上传开始：round={job['epoch']} bucket={storage['bucket']} key={job['key']}"
             )
+            content = Path(job["path"]).read_bytes()
+            if not authorized():
+                job["status"] = "pending"
+                return
             outcome = self.upload(
                 storage,
                 job["key"],
-                Path(job["path"]).read_bytes(),
+                content,
                 job["epoch"],
                 job["version"],
+                **({"authorized": authorized} if self.upload is conditional_upload else {}),
             )
+            if outcome == "deferred":
+                job["status"] = "pending"
+                self.logger.info(f"报告上传延后：round={job['epoch']}，当前设备已失去上传授权")
+                return
             job["status"], job["error"] = "succeeded", ""
             self.logger.info(
                 f"报告上传完成：round={job['epoch']} key={job['key']} outcome={outcome}"
@@ -205,7 +235,8 @@ class ReportWorker:
             job["attempts"] += 1
             job["status"] = "failed" if job["attempts"] >= 4 else "pending"
             job["next_attempt"] = time.time() + [5, 15, 30, 30][job["attempts"] - 1]
-            job["error"] = type(error).__name__
+            code = str(getattr(error, "response", {}).get("Error", {}).get("Code", ""))
+            job["error"] = type(error).__name__ + (f" ({code})" if code.isascii() and code.isalnum() else "")
             self.logger.warning(
                 f"报告上传{job['status']}：round={job['epoch']} attempt={job['attempts']} error={job['error']}"
             )

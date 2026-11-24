@@ -74,7 +74,7 @@ class MissionActions:
                 "data": {k: v for k, v in mission.items() if k != "mission_id"},
             }
             # Relay only to the explicitly named participants, never an open broadcast.
-            self.node.accept_request(envelope, relay=True)
+            self.node.ingress.accept_request(envelope, relay=True)
             result.accepted = True
             future = Future()
             self.waiter = {
@@ -105,7 +105,7 @@ class MissionActions:
         goal, result = item["goal"], item["result"]
         model = self.node.core.model
         if goal.is_cancel_requested:
-            self.node.request_control("task.stop")
+            self.node.ingress.request_control("task.stop")
             result.message = "停止请求已提交；全局停止须等待多数派与本机停止证据"
             goal.canceled()
         elif (

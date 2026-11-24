@@ -7,6 +7,8 @@ import uuid
 
 from swarm_protocol.contracts import TERMINAL, public_mission
 
+from swarm_protocol.replication import validate_command_size
+
 from .model import MissionState
 
 
@@ -47,25 +49,40 @@ class Coordinator:
 
     def receive_consensus(self, value):
         previous = self.consensus
+        if value["round_epoch"] < previous.get("round_epoch", 0):
+            return
         if previous and value["round_epoch"] > previous.get("round_epoch", 0):
             if self.model.state not in TERMINAL | {"EMPTY"}:
                 raise ValueError("cannot replace active application round")
             self.model = MissionState()
-            self.pending = None
             self.events.clear()
             self.additions.clear()
             self.controls.clear()
-            self.plan_request, self.plan_response = None, None
-        self.consensus = copy.deepcopy(value)
         if (
-            previous.get("term") != value["term"]
+            previous.get("round_epoch") != value["round_epoch"]
+            or previous.get("term") != value["term"]
             or previous.get("leader_id") != value["leader_id"]
         ):
             self.pending = None
             self.plan_request, self.plan_response = None, None
-        for entry in value["entries"]:
-            if entry["index"] <= self.model.last_index:
-                continue
+        self.consensus = copy.deepcopy(value)
+
+    def receive_entries(self, value):
+        if any(value.get(k) != self.consensus.get(k) for k in ("round_epoch", "boot_id")):
+            return False
+        if value["after"] != self.model.last_index:
+            return False
+        entries = value["entries"]
+        if any(
+            entry["index"] != value["after"] + i
+            for i, entry in enumerate(entries, 1)
+        ):
+            raise ValueError("共识条目不连续")
+        # ROS state and entries travel on different topics. Retry once the
+        # matching commit watermark has arrived.
+        if entries and entries[-1]["index"] > self.consensus.get("commit_index", 0):
+            return False
+        for entry in entries:
             command = entry["command"]
             self.model.apply(command, entry["index"])
             if self.pending and self.pending["id"] == command["id"]:
@@ -75,6 +92,7 @@ class Coordinator:
                     command["robot_id"], command["session_id"], command["event_id"]
                 )
                 self.events.pop(command["event_id"], None)
+        return True
 
     def heartbeat(self, value, monotonic):
         robot = value.get("robot_id")
@@ -93,6 +111,7 @@ class Coordinator:
         c = self.consensus
         return bool(
             c.get("leader_id") == self.robot and c.get("authority") and not self.error
+            and self.model.last_index >= c.get("commit_index", 0)
         )
 
     def receive_event(self, value):
@@ -119,6 +138,7 @@ class Coordinator:
             "time": wall,
             **fields,
         }
+        validate_command_size(value)
         # Fail before proposing, and never partially mutate authoritative state.
         candidate = copy.deepcopy(self.model)
         candidate.apply(value, self.model.last_index + 1)
@@ -359,13 +379,13 @@ class Coordinator:
                         wall,
                     )
                 else:
-                    self._command(
-                        "PLAN",
-                        wall,
-                        revision=m.revision,
-                        plan=result["plan"],
-                        deadline=wall + self.phase_timeout,
-                    )
+                    try:
+                        self._command(
+                            "PLAN", wall, revision=m.revision,
+                            plan=result["plan"], deadline=wall + self.phase_timeout,
+                        )
+                    except ValueError as error:
+                        self._finish("FAILED", "规划结果无法提交：" + str(error), wall)
                 return
             if not self.plan_request and all(self._ready(r, now) for r in m.members):
                 self.plan_request = f"{m.epoch}-r{m.revision}-t{self.consensus['term']}-{uuid.uuid4().hex}"
@@ -419,6 +439,14 @@ class Coordinator:
                     self._finish("FAILED", "路线生成或短暂STALE启动就绪等待超时", wall)
                 return
             for r in sorted(m.executable - set(m.started) - set(m.excluded)):
+                blockers = sorted(m.dependency_blockers(r))
+                if blockers:
+                    self._finish(
+                        "FAILED",
+                        f"{r} 路线未启动：前序设备未确认到达安全终点：" + ",".join(blockers),
+                        wall,
+                    )
+                    return
                 if m.dependencies_finished(r) and all(
                     self._ready(p, now) for p in m.executable - set(m.excluded)
                 ):

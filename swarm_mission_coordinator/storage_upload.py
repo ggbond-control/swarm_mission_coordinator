@@ -4,7 +4,7 @@ import hashlib
 import json
 
 
-def conditional_upload(storage, key, content, epoch, version):
+def conditional_upload(storage, key, content, epoch, version, *, authorized=lambda: True):
     """CAS prevents a delayed older leader from overwriting newer report bytes.
 
     Fail explicitly if the installed SDK/server does not implement conditional
@@ -68,7 +68,10 @@ def conditional_upload(storage, key, content, epoch, version):
                     return "superseded"
             condition = {"IfMatch": old["ETag"]}
         except ClientError as error:
-            if error.response["Error"]["Code"] not in {"404", "NoSuchKey", "NotFound"}:
+            # A prefix-scoped credential can see HTTP 403 for a missing key
+            # when ListBucket is denied. Conditional create still cannot
+            # replace an existing object.
+            if error.response["Error"]["Code"] not in {"403", "404", "AccessDenied", "NoSuchKey", "NotFound"}:
                 raise
         # Ubuntu Jazzy's botocore may lack conditional PUT model fields. Sign
         # the actual HTTP headers with SigV4 rather than dropping the condition.
@@ -116,6 +119,9 @@ def conditional_upload(storage, key, content, epoch, version):
         )
         connection = connection_class(endpoint.hostname, endpoint.port, timeout=3)
         try:
+            connection.connect()
+            if not authorized():
+                return "deferred"
             connection.request("PUT", path, body=content, headers=dict(request.headers))
             if connection.sock:
                 connection.sock.settimeout(10)

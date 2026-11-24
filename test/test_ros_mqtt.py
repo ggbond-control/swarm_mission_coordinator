@@ -4,6 +4,7 @@ SWARM_RUN_ROS=1 and SWARM_BROKER point at a local broker executable. Run from
 the workspace environment after building all six new packages and interfaces.
 """
 
+from contextlib import contextmanager
 import json
 import os
 import signal
@@ -32,7 +33,7 @@ def wait_for(predicate, timeout=45, message="condition"):
 
 
 class Device:
-    def __init__(self, root, index, broker_port):
+    def __init__(self, root, index, broker_port, *, domain_base, offline_timeout):
         from rclpy.context import Context
         from rclpy.executors import SingleThreadedExecutor
         from rclpy.node import Node
@@ -41,7 +42,7 @@ class Device:
         self.robot = f"R{index}"
         self.root = root / self.robot
         self.root.mkdir()
-        self.domain = 181 + index
+        self.domain = domain_base + index
         self.processes = {}
         self.logs = []
         self.environment = {
@@ -75,7 +76,6 @@ class Device:
                     "robot_id": self.robot,
                     "task_hub_prefix": "/swarm/mock",
                     "nominal_speed": 1.0,
-                    "permit_seconds": 5.0,
                 },
             ),
             "transport": (
@@ -98,7 +98,7 @@ class Device:
                     "footprint_radius": 0.1,
                     "phase_timeout": 15.0,
                     "planning_timeout": 30.0,
-                    "offline_timeout": 5.0,
+                    "offline_timeout": offline_timeout,
                     "stale_timeout": 3.0,
                 },
             ),
@@ -205,15 +205,15 @@ class Device:
             log.close()
 
 
-@pytest.fixture(scope="module")
-def local_fleet(tmp_path_factory):
+@contextmanager
+def simulated_fleet(tmp_path_factory, scenario, *, domain_base, offline_timeout=5.0):
     import paho.mqtt.client as mqtt
     from support import make_map
 
     base = (
-        Path(os.environ.get("SWARM_TEST_EVIDENCE", ""))
+        Path(os.environ["SWARM_TEST_EVIDENCE"]) / scenario
         if os.environ.get("SWARM_TEST_EVIDENCE")
-        else tmp_path_factory.mktemp("swarm_ros")
+        else tmp_path_factory.mktemp(scenario)
     )
     base.mkdir(parents=True, exist_ok=True)
     with socket.socket() as sock:
@@ -248,7 +248,8 @@ def local_fleet(tmp_path_factory):
     devices = []
     try:
         for i in range(3):
-            devices.append(Device(base, i, port))
+            devices.append(Device(base, i, port, domain_base=domain_base,
+                                  offline_timeout=offline_timeout))
         wait_for(
             lambda: all(d.agent.get("ready") for d in devices),
             45,
@@ -263,6 +264,7 @@ def local_fleet(tmp_path_factory):
             "broker": broker,
             "broker_log": log,
             "broker_config": config,
+            "broker_port": port,
         }
         yield fleet
     finally:
@@ -274,6 +276,26 @@ def local_fleet(tmp_path_factory):
         active.terminate()
         active.wait(timeout=5)
         log.close()
+
+
+@pytest.fixture(scope="module")
+def local_fleet(tmp_path_factory):
+    with simulated_fleet(tmp_path_factory, "workflows", domain_base=181) as fleet:
+        yield fleet
+
+
+@pytest.fixture(scope="module")
+def takeover_fleet(tmp_path_factory):
+    with simulated_fleet(tmp_path_factory, "leader-takeover", domain_base=191) as fleet:
+        yield fleet
+
+
+@pytest.fixture
+def broker_recovery_fleet(tmp_path_factory):
+    # Reconnect after the local lease expires and while all voters are eligible.
+    with simulated_fleet(tmp_path_factory, "broker-recovery", domain_base=201,
+                         offline_timeout=30.0) as fleet:
+        yield fleet
 
 
 def submit(fleet, epoch, tasks=3):
@@ -425,7 +447,7 @@ def test_real_mqtt_ros_skip_retry_and_continuous_round(local_fleet):
     )
     wait_for(
         lambda: all(
-            d.audit.get("route", {}).get("route_name", "").startswith("sw2-")
+            (d.audit.get("route") or {}).get("route_name", "").startswith("sw2-")
             for d in f["devices"]
         ),
         45,
@@ -519,7 +541,7 @@ def test_follower_addition_and_local_stop_are_replicated(local_fleet):
     submit(f, 4)
     wait_for(
         lambda: all(
-            d.audit.get("route", {}).get("route_name", "").startswith("sw4-")
+            (d.audit.get("route") or {}).get("route_name", "").startswith("sw4-")
             for d in f["devices"]
         ),
         45,
@@ -564,12 +586,12 @@ def test_follower_addition_and_local_stop_are_replicated(local_fleet):
         follower.probe.destroy_client(stop)
 
 
-def test_broker_loss_expires_permits_without_false_completion(local_fleet):
-    f = local_fleet
+def test_broker_loss_expires_permits_without_false_completion(broker_recovery_fleet):
+    f = broker_recovery_fleet
     submit(f, 5)
     wait_for(
         lambda: all(
-            d.audit.get("route", {}).get("route_name", "").startswith("sw5-")
+            (d.audit.get("route") or {}).get("route_name", "").startswith("sw5-")
             for d in f["devices"]
         ),
         45,
@@ -645,12 +667,13 @@ def test_action_cancel_during_initial_admission(local_fleet):
         client.destroy()
 
 
-def test_real_mqtt_ros_leader_loss_keeps_unknown_task(local_fleet):
-    f = local_fleet
+def test_real_mqtt_ros_leader_loss_keeps_unknown_task(takeover_fleet):
+    f = takeover_fleet
     submit(f, 7)
     wait_for(
         lambda: all(
-            d.audit.get("route", {}).get("route_name", "").startswith("sw7-")
+            (d.audit.get("route") or {}).get("route_name", "").startswith("sw7-")
+            and d.agent.get("start_phase") == "started"
             for d in f["devices"]
         ),
         45,
@@ -662,6 +685,8 @@ def test_real_mqtt_ros_leader_loss_keeps_unknown_task(local_fleet):
                 d.state.get("leader_id")
                 for d in f["devices"]
                 if d.state.get("state") == "ACTIVE"
+                and d.state.get("leader_id") == d.robot
+                and d.state.get("quorum_available")
             ),
             None,
         )
@@ -700,3 +725,87 @@ def test_real_mqtt_ros_leader_loss_keeps_unknown_task(local_fleet):
         "replicated failure",
     )
     assert any(d.state["unconfirmed_tasks"] for d in survivors)
+
+
+def test_web_console_drives_a_new_round_after_takeover(takeover_fleet, tmp_path, monkeypatch):
+    """Run this last, since the console allocates a persistent monotonic epoch."""
+    from threading import Thread
+    from urllib.request import Request, urlopen
+
+    tool = Path(__file__).resolve().parents[2] / "swarm_dev_console"
+    monkeypatch.syspath_prepend(str(tool))
+    console_module = pytest.importorskip("swarm_dev_console.server")
+    from support import mission
+
+    fleet = takeover_fleet
+    survivors = [d for d in fleet["devices"] if d.state.get("state") == "FAILED"]
+    assert len(survivors) == 2
+    data = mission(fleet["maps"], [d.robot for d in survivors], tasks=2)
+    data.pop("mission_id", None)
+    with console_module.ThreadingHTTPServer(("127.0.0.1", 0), console_module.Handler) as http:
+        http.console = console_module.Console(tmp_path, "127.0.0.1", fleet["broker_port"])
+        thread = Thread(target=http.serve_forever)
+        thread.start()
+        address = f"http://127.0.0.1:{http.server_port}"
+        try:
+            wait_for(lambda: http.console.connected, 10, "console MQTT ready")
+            data["round_epoch"] = http.console.new_epoch()
+            outgoing = Request(
+                address + "/api/request",
+                headers={"X-Swarm-Session": http.console.token},
+                data=json.dumps({"bid": "console-e2e", "method": "task.execute",
+                                 "data": data}).encode(),
+            )
+            with urlopen(outgoing, timeout=5) as response:
+                epoch = json.load(response)["round_epoch"]
+            wait_for(lambda: any(
+                d.state.get("round_epoch") == epoch and d.state.get("state") == "ACTIVE"
+                for d in survivors
+            ), 45, "console-issued round running")
+            end = time.monotonic() + 20
+            while time.monotonic() < end:
+                for device in survivors:
+                    device.finish()
+                if (http.console.snapshot().get("mission") or {}).get("state") == "COMPLETED":
+                    break
+                time.sleep(0.15)
+            with urlopen(address + "/api/evidence", timeout=5) as response:
+                snapshot = json.load(response)
+            assert snapshot["mission"]["round_epoch"] == epoch
+            assert snapshot["mission"]["state"] == "COMPLETED"
+            assert snapshot["mission"]["completed_tasks"] == 2
+            assert set(snapshot["mission"]["completed_task_ids"]) == {"p0", "p1"}
+            assert snapshot["mission"]["map_package"] == data["map_package"]
+            assert any(topic == "fh/swarm/dispatch/services"
+                       and frame["data"] == {**data, "round_epoch": epoch}
+                       for topic, frame in fleet["messages"] if frame.get("bid") == "console-e2e")
+            assert snapshot["plan"]["round_epoch"] == epoch
+            assert any(item.get("authority") for item in snapshot["devices"])
+            assert snapshot["requests"][0]["status"] == "已受理"
+            # The device workflow continues after its temporary platform exits.
+            data["round_epoch"] = http.console.new_epoch()
+            detached = Request(
+                address + "/api/request", headers={"X-Swarm-Session": http.console.token},
+                data=json.dumps({"bid": "console-detached", "method": "task.execute",
+                                 "data": data}).encode(),
+            )
+            with urlopen(detached, timeout=5) as response:
+                assert json.load(response)["round_epoch"] == data["round_epoch"]
+            wait_for(lambda: all(
+                device.state.get("round_epoch") == data["round_epoch"]
+                and device.state.get("state") == "ACTIVE" for device in survivors
+            ), 45, "second task active")
+            http.console.client.disconnect()
+            http.console.client.loop_stop()
+
+            def completed_without_console():
+                for device in survivors:
+                    device.finish()
+                return all(device.state.get("state") == "COMPLETED" for device in survivors)
+
+            wait_for(completed_without_console, 30, "devices finish after console disconnect")
+            assert all(device.state["completed_tasks"] == 2 for device in survivors)
+        finally:
+            http.shutdown()
+            thread.join(timeout=5)
+            http.console.close()

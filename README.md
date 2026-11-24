@@ -1,141 +1,143 @@
 # Swarm 多机任务协调
 
-`swarm_*` 是设备端运行的全分布式协同开发版本（0.1）。每台设备保存任务副本，由具有固定多数派权限的 Leader 协调规划和执行。云端保留平台、MQTT Broker 和存储，运行任务时不需要云端调度 ROS 节点。
+Swarm 在每台设备部署相同的六个 ROS 包。平台提供任务 JSON，具有固定多数派权限的 Leader 协调规划，设备保存已提交的任务副本并执行本机路线。云端部署平台、MQTT Broker 和对象存储。
 
-当前交付已通过本地隔离测试及 CYVET-A／B 双机小规模纯导航测试。平台实际前后端、复杂多机运动、5G 故障注入和真实 MinIO 条件写入尚未验收，不能直接替换现有演示部署。验证记录和复现命令见 [TEST_LOG.md](TEST_LOG.md)，设计依据见 [架构方案](../多机协同全分布式架构方案_部门评审稿.md)。
-
-## 模块
+## 模块与职责
 
 | 包 | 职责 |
 | --- | --- |
-| [swarm_protocol](../swarm_protocol/README.md) | JSON 协议、校验、摘要、持久化和进程锁 |
-| [swarm_consensus](../swarm_consensus/README.md) | 固定成员 Raft、唯一 Leader、日志提交、读屏障、启动会话与隔离 |
-| [swarm_mission_planner](../swarm_mission_planner/README.md) | 独立地图搜索、能力分配和路线依赖 |
-| [swarm_execution_agent](../swarm_execution_agent/README.md) | 本机 YAML、TaskHub、累计导航证据、结果 outbox 和执行授权 |
-| [swarm_mqtt_transport](../swarm_mqtt_transport/README.md) | MQTT 消息转发；控制和图片使用独立连接 |
-| swarm_mission_coordinator | 提交驱动的任务状态机、重分配、平台事件、图片与报告 |
+| swarm_protocol | JSON 校验、固定主题、摘要、原子存储和审计记录 |
+| swarm_consensus | 固定成员 Raft、Leader 选举、日志复制、读屏障和实例隔离 |
+| swarm_mission_planner | C++ 地图搜索、能力分配、路线协调及 Python ROS 适配 |
+| swarm_execution_agent | TaskHub YAML、累计导航证据、执行授权和结果重发 |
+| swarm_mqtt_transport | 平台及设备间 MQTT 转发，控制与图片使用独立连接 |
+| swarm_mission_coordinator | 任务状态机、新增与重分配、平台事件、图片和报告 |
 
-六个新包不导入、链接或调用原四个协同包。旧包保留用于半分布式演示。TaskHub 和接口继续使用 `inspection_*`；Bringup 增加显式模式选择。
+设备运行五个节点，swarm_protocol 为共享库。coordinator 内的 model.py 应用提交事实，coordinator.py 提出决策，ingress.py 处理请求，permits.py 管理执行授权，mission_evidence.py 管理报告与图片。ROS 适配集中在 node.py 和 api.py。
 
-`swarm_mission_coordinator` 是整套系统的启动与文档入口，因而保存总览、协议、配置和跨包集成记录。它在**每台设备**运行，不是固定中央主机；当前 Leader 才能提交决策。各包自己的 README／TEST_LOG 说明本包职责，并链接到统一集成记录。
+PC 端 swarm_dev_console 临时代替平台发布请求和订阅状态。六个板端包独立于调试台，平台和调试台使用相同的公开 MQTT 协议。测试范围和结果统一记录在 [TEST_LOG](TEST_LOG.md)。
 
-目录按职责组织：`examples/` 保存版本化报告和平台消息样例，`test/` 保存测试，内层同名 Python 目录保存运行代码；设备配置及启动入口统一归 Bringup，本包不维护独立 `launch/`、`config/`。协调器内部 `model.py` 只应用已提交状态，`coordinator.py` 产生下一步提案，`node.py`／`api.py` 适配 ROS，`platform.py` 投影事件，`media.py` 管理图片，`reporting.py` 管理报告与后台任务，`storage_upload.py` 单独处理 S3 条件写入。
+## 构建与启动
 
-```mermaid
-flowchart LR
-  P[平台] <--> B[MQTT Broker]
-  B <--> T[每台设备的 Transport]
-  T <--> C[Coordinator]
-  C <--> R[Consensus 副本]
-  C --> G[本机 Planner]
-  C --> A[本机 Agent]
-  A <--> H[inspection_task_hub]
-  H --> N[导航及挂载操作]
-```
-
-## 安装与构建
-
-使用 ROS 2 Jazzy，从工作区根目录构建。需要系统依赖 `python3-paho-mqtt`、`python3-boto3`、`python3-yaml`、`python3-pil`、`python3-numpy` 和 `python3-scipy`；这些 Python 运行依赖不是 `colcon` 自动安装的依赖。
+设备使用 ROS 2 Jazzy。先加载 TaskHub、共享接口及 Bringup 所在工作区，再从协同工作区根目录构建。使用 rosdep 安装 package.xml 声明的系统依赖，包含 Paho、boto3、PyYAML、Pillow、Boost、OpenCV、yaml-cpp 和 nlohmann JSON。
 
 ```bash
-cd ~/colcon_ws/agibot_d1max_ws
 source /opt/ros/jazzy/setup.bash
-colcon build --packages-select inspection_interfaces swarm_protocol swarm_consensus \
+source ~/Workspace/task_ws/install/local_setup.bash
+cd ~/Workspace/cooperation_ws
+colcon build --packages-select swarm_protocol swarm_consensus \
   swarm_mission_planner swarm_execution_agent swarm_mqtt_transport \
   swarm_mission_coordinator --symlink-install
-source install/setup.bash
+source install/local_setup.bash
 ```
 
-设备已有 TaskHub 和 Bringup 时继续使用原工作区的对应包。运行新系列不需要安装原四个协同包。
-
-## 启动配置
-
-设备配置统一在 `inspection_bringup/config`，按 `system.yaml → models/<model>/system.yaml → robot.yaml` 合并。日常仅修改 `robot.yaml`：
+Bringup 按 system.yaml、models/<model>/system.yaml、robot.yaml 合并配置。日常在 robot.yaml 选择协同模式。
 
 ```yaml
 model: cyvet
 robot_id: CYVET-A
 system:
   cooperation:
-    mode: swarm  # disabled | coordination | swarm
+    mode: swarm
 ```
 
-修改后执行 `inspection_bringup/scripts/manage_inspection_services.sh restart system`。协同模式没有命令行覆盖；旧模块开关、`config_path`、设备专用 swarm YAML 和 `allow_motion` 均已删除，旧配置明确报错。`disabled` 关闭所有协同节点和协同心跳，`coordination` 启动原半分布式三节点，`swarm` 启动五个新节点；普通平台设备状态、TaskHub 和导航按原模块配置运行。
+disabled 关闭协同节点，coordination 启动半分布式协同，swarm 启动全分布式五节点。设备身份、能力、标称速度、MQTT 认证及 TLS 使用 Bringup 合并配置。配置由启动入口以 ROS 参数传入各节点。
 
-Bringup 从现有 `mqtt` 读取连接参数，从 `device_status.json` 读取能力及速度，从顶层 `robot_id` 取得身份，通过 ROS 参数字典分别传给五个节点。Coordinator 不自行读取 YAML，不维护第二套配置文件。`launching.py` 仅构造节点，不读取设备文件。默认连接真实 TaskHub，由已提交启动命令和多数派执行许可控制路线；不需要额外执行开关。未收到任务不会启动路线，但 Agent 启动时会取消旧路线以建立安全状态，切换前应先确认任务停止。
+```bash
+~/Workspace/task_ws/src/inspection_bringup/scripts/manage_inspection_services.sh restart cooperation
+```
 
-模拟测试显式将 `cooperation.swarm.agent.task_hub_prefix` 配为 `/swarm/mock` 并启动对应 mock，使用独立 ROS 域与 MQTT 主题；它是测试接口映射，不是实机执行开关。独立启动节点也会接入真实 TaskHub，运行前须核对服务映射。
+首次更新服务脚本时执行 install cooperation。协同净空参数在 cooperation.swarm.footprint_radius 和 free_thresh 配置一次，同时传给地图预检和规划器。其他参数通常使用节点默认值。
 
-`cooperation.swarm` 只需覆盖差异，未填写的选举与业务超时使用节点默认值。净空半径、空闲阈值在 `swarm.footprint_radius`、`swarm.free_thresh` 各配置一次，同时传给预检和 planner。`cooperation.coordination.agent.auto_execute` 仅保留原半分布式语义。TLS 相关配置复用 `mqtt.tls`、`mqtt.ca`；按实际连接设置使用 TLS 或明文，不需要额外明文许可开关。日常无需 `cooperation.swarm`，只有高级调试或隔离测试才覆盖。
-
-Agent 检查本 ROS 域的旧控制节点和重复服务提供者，存在冲突时拒绝控制；该检查不构成跨网络硬件互锁。模式默认 `disabled`，不会默认启用任何控制栈。
+Agent 默认接入本机 TaskHub，并在启动时取消旧路线以建立停止状态。测试通过 task_hub_prefix 指向隔离的模拟服务。存在重复控制节点或服务提供者时，Agent 拒绝控制。 [Bringup 使用说明](../inspection_bringup/README.md)
 
 ## 任务输入
 
-平台在固定主题 `fh/swarm/dispatch/services` 发布 `task.execute`，返回主题如下。全分布式不订阅原 `fh/fleet/dispatch/services`，不向原 fleet 心跳主题发送消息。
-
-| 用途 | 固定主题 |
-| --- | --- |
-| 平台请求 | `fh/swarm/dispatch/services` |
-| 请求应答 | `fh/swarm/dispatch/services_reply` |
-| 任务事件 | `fh/swarm/dispatch/events` |
-| 任务状态 | `fh/swarm/dispatch/state` |
-| 设备心跳 | `fh/swarm/device/<robot_id>/heartbeat` |
-| 设备内部广播 | `fh/swarm/peer/inspection-swarm/broadcast/<robot_id>` |
-| 设备内部定向 | `fh/swarm/peer/inspection-swarm/to/<recipient>/<sender>` |
-
-内部固定集群名为 `inspection-swarm`，只是消息隔离标识；本轮投票名单仍由平台 `robot_ids` 决定。主题和集群名不含日期或协议版本，不随普通代码升级改变。隔离测试可覆盖 `cooperation.swarm.cluster_id`、`mqtt_prefix`、`platform_prefix`；设备心跳保持上述固定主题，测试使用独立 Broker 或模拟设备身份。
-
-消息内容的内部 `protocol_version` 与 TaskHub 导航快照版本分别保留，只有不兼容协议变化才升级，不因普通修复而要求平台修改。
-
-请求示例：
+平台向 fh/swarm/dispatch/services 发布以下请求。map_package 必须是各参与设备上实际存在、可读的地图目录绝对路径。地图预先部署，MQTT 只传路径和任务数据。
 
 ```json
 {
-  "bid": "demo-001",
+  "bid": "mission-001",
   "tid": "request-001",
+  "timestamp": 1795490000000,
   "method": "task.execute",
   "data": {
     "round_epoch": 101,
-    "robot_ids": ["X30-A", "CYVET-A", "CYVET-B"],
     "map_package": "/home/cat/Workspace/Maps/company2",
-    "tasks": [
-      {
-        "id": "point-1",
-        "location": {"frame_id": "map_000", "pos": [3.0, 4.0, 0.0]},
-        "tasks": [{"method": "wait", "requirements": ["device"],
-                   "params": {"timing": "after_arrival", "duration": 2}}]
-      }
-    ]
+    "robot_ids": ["X30-A", "X30-B"],
+    "tasks": [{
+      "id": "point-1",
+      "location": {
+        "frame_id": "company2",
+        "pos": [-5.1, 11.0, 0.0],
+        "orientation": [0.0, 0.0, 0.0, 1.0]
+      },
+      "tasks": []
+    }]
   }
 }
 ```
 
-`round_epoch` 为平台持久生成、按集群单调增加的正安全整数；与选举任期不同。名单中的全员都必须参与首次准备，不会静默缩小名单。位姿、服务、地图摘要和启动会话必须匹配。准备期限到达后明确失败；没有多数派时无法提交全局结论。
+round_epoch 是平台持久生成、按集群递增的正安全整数，同内容重发使用原值。名单确定本轮固定投票成员。名单全员通过服务、位姿、地图摘要和启动会话检查后才能激活。
 
-同轮同内容幂等，冲突内容拒绝。新 epoch 不覆盖活动执行；全新任务不要求先 reset。ID 大小写敏感，使用字母、数字、点、下划线和连字符。
+tasks[].id 在一轮中唯一且区分大小写，新增点不得复用。规划、重分配、补执行、平台通知及报告保留该 ID。平台跨轮关联使用 round_epoch 和 task_id。位置为地图米坐标，frame_id 对应包内地图帧。orientation 缺省时使用 yaw 角度生成四元数。
 
-`location.pos` 为本地图米坐标；可选 quaternion `orientation`，缺省使用 `yaw`（度）。每点 `tasks` 必填，纯导航使用空数组。挂载操作 `params` 直接保留为 TaskHub YAML 字段，能力由操作的 `requirements` 汇总，另包含基础 `device`。
+每点 tasks 必填，空数组为纯导航。挂载操作包含 method、requirements 和 params，能力由 requirements 汇总，params 传给 TaskHub YAML。可选 service_seconds 表示规划估计耗时。storage 为可选报告存储配置。
 
-`task.add` 携带当前轮次、同一名单、同一地图及新增点。未确认到达点和跳点参与事件重分配，不消耗最终补执行额度。重复点 ID 拒绝。
+| 方法 | data 内容 |
+| --- | --- |
+| task.execute | round_epoch、map_package、robot_ids、tasks，可选 storage |
+| task.add | 当前 round_epoch、同一地图路径及原始名单、仅新增的 tasks |
+| task.stop / task.reset | 当前 round_epoch，bid 对应当前任务 |
 
-## 本机 ROS 接口
+活动轮次不能被新任务覆盖。停止请求须经多数派提交及本机执行确认。新轮开始前，上一轮物理执行须已停止。
 
-| 名称 | 类型 | 含义 |
-| --- | --- | --- |
-| `/swarm/mission/plan` | `inspection_interfaces/action/PlanMission` | 文件任务入口；文件不含 mission_id，Action 字段为准 |
-| `/swarm/mission/replan` | 同上 | 当前轮新增点入口，文件只放新点，mission_id 与当前任务一致 |
-| `/swarm/mission/stop`、`reset` | `std_srvs/srv/Trigger` | 请求本机停止，并把全局取消请求转发给 Leader |
-| `/swarm/mission/state` | `std_msgs/msg/String` | 当前已提交任务摘要、Leader 和多数派状态 |
-| `/swarm/agent/local_stop` | `std_srvs/srv/Trigger` | 仅请求本机停止，不宣称全局已取消 |
+### TaskHub 输出
 
-Action 返回 `planned` 表示计划和启动确认已经提交，不表示整轮执行完成。取消及 Trigger 成功表示请求已受理，全局停止仍需多数派和执行证据。少数派期间可以请求本机停止，不能伪造全局 CANCELLED。
+每台有执行路线的设备生成 runtime/agent/<route_name>.yaml，使用 route.name 和 route.waypoints 结构。Agent 获得提交授权后，通过 StartRoute 的 route_config_path 交给本机 TaskHub。每次重分配产生新修订及独立 YAML。
 
-本机文件输入会定向传递给本轮其他参与设备。各设备的地图必须预先部署在输入所指路径；本版本不负责地图下载。
+TaskHub 的数值航点号和操作号适用于本机路线。Agent 保存其到业务 task_id 的映射，共址任务可合并为同一航点，等待和转向检查点可没有业务 ID。
 
-## 执行和故障语义
+### 本机 ROS 入口
 
-业务状态集中在 `model.py` 的 `MissionState`，只有已提交命令能修改；`coordinator.py` 负责根据事实提出下一条命令，ROS 和 MQTT 适配层不自行改写任务结论。
+| 接口 | 类型与用途 |
+| --- | --- |
+| /swarm/mission/plan | inspection_interfaces/action/PlanMission，读取任务 JSON |
+| /swarm/mission/replan | 同一 Action，文件仅包含当前轮新增点 |
+| /swarm/mission/stop、reset | std_srvs/srv/Trigger，请求本机停止及全局取消 |
+| /swarm/mission/state | std_msgs/msg/String，已提交任务摘要 |
+| /swarm/agent/local_stop | std_srvs/srv/Trigger，请求本机停止 |
+
+Action 的 mission_id 为任务标识，文件须包含 round_epoch。planned 表示计划及启动确认已提交。停止接口受理成功后，仍须等待执行停止确认和全局终态。
+
+## MQTT 与共识
+
+| 用途 | 固定主题 |
+| --- | --- |
+| 请求 / 应答 | fh/swarm/dispatch/services、services_reply |
+| 事件 / 状态 | fh/swarm/dispatch/events、state |
+| 设备心跳 | fh/swarm/device/<robot_id>/heartbeat |
+| 内部广播 | fh/swarm/peer/inspection-swarm/broadcast/<sender> |
+| 内部定向 | fh/swarm/peer/inspection-swarm/to/<recipient>/<sender> |
+| 图片 | 内部前缀后增加 media，再使用 broadcast 或 to |
+
+内部信封包含 protocol_version、cluster_id、robot_id、boot_id、to、kind、round_epoch 和 data。版本只在协议不兼容时变更。Broker 的认证与 ACL 应限制设备只能使用自己的 sender 身份。控制消息使用 QoS 1、非 retained 发布。
+
+| 字段 | 含义 |
+| --- | --- |
+| round_epoch | 任务轮次 |
+| term | 同轮持久化的选举任期 |
+| sessions | 激活时绑定 Agent session_id 和 consensus_boot |
+| excluded | 本轮隔离成员，只增不减，多数派分母固定 |
+| revision | 任务方案修订 |
+| commit_index | 已提交日志位置 |
+| route_name | sw<epoch>-<mission 摘要前16位>-r<revision>-<robot_id> |
+
+Raft 使用预投票、持久投票、日志比较和当前任期提交规则。执行许可经过当前任期的多数派读屏障，期限按 Agent 发起请求的单调时钟计算。
+
+落后副本通过 AppendEntries 分批追赶，每批最多 32 条、目标 1 MiB，较大单条命令独立传输，受 8 MiB 信封预算限制。本机 consensus/state 提供水位，coordinator 经 consensus/fetch 和 consensus/entries 应用连续批次。追上本机提交水位后才具有业务决策权。
+
+## 执行与故障处理
 
 ```text
 PREPARING → PLANNING → PLANNED → ACTIVE → COMPLETED / FAILED
@@ -144,62 +146,95 @@ PREPARING → PLANNING → PLANNED → ACTIVE → COMPLETED / FAILED
 活动阶段 → STOPPING → CANCELLED
 ```
 
-- 多数派固定为初始名单的过半数，不因掉线而降低。失去多数派后无法提交新计划、续发执行授权或确认全局终态。
-- 每个执行许可经过当前任期的多数派读屏障；到期时间以 Agent 发起请求的本机单调时钟计算，迟到消息不能续命。
-- Leader 故障但多数派仍在时重新选举，接续已提交状态。进程重启产生新实例，不能恢复旧轮执行／投票资格。
-- 已启动但停止未经确认的失联任务保留 UNKNOWN，不自动转移。已确认到达点不重分。
-- 新增和掉线先暂停、确认停止证据，再生成新 revision。暂停后的旧 TaskHub 路线还需取消，才能启动替代路线。
-- 全队有效路线正常结束后，对剩余跳点整轮仅补执行一次；再次跳过、能力不足或结果未知明确 FAILED。
-- 授权过期后不会自动恢复旧路线；通信恢复并提交停止事实后，整轮明确失败，可安全开始新轮。
+- Leader 掉线且仍有固定多数派时，其余副本选出新 Leader 并接续提交状态。失去多数派后无法提交新计划、续发执行许可或确认全局终态。
+- 进程重启产生新实例，旧轮执行及投票资格隔离。未确认停止的失联任务保留 UNKNOWN，已确认到达点不重新分配。
+- 新增或掉线重分配先收集停止及导航证据，再规划未完成和跳过的点。全队有效路线结束后，剩余跳点整轮仅补执行一次。
+- 再次跳过、能力不足或结果未知明确结束为 FAILED。授权过期后暂停旧路线，恢复通信并提交停止事实后明确失败。
+- starting 写入磁盘后才调用 TaskHub。旧世代的迟到启动成功触发补偿取消。调用超时须先排空在途服务，再处理替代路线。
 
-软件许可不能在进程卡死、设备断电或导航失控时提供硬件急停保证。
+软件执行许可无法覆盖设备断电、进程卡死等硬件急停需求。多设备跨图目前受 ROOT 空间协调限制，规划器会拒绝不支持的情况。
 
-## 地图与规划
+### 累计导航结果
 
-读取 Nav2 YAML／图像，处理地图原点旋转、障碍／未知区及净空膨胀，支持 `map_relations.csv` 和显式 `transition_points.csv`。起点非法时汇总机器人、地图、坐标和原因。
+TaskHub 通过 /task_hub/navigation_results 的标准 String JSON 提供结果，现有 StartRoute、GetStatus、Trigger 暂停和取消服务继续使用。
 
-当前规划器使用独立的栅格最短路及贪心负载分配。存在交叉冲突时按实际路线封存结果建立串行依赖，停车位置冲突和依赖环明确拒绝。它不是旧规划器的性能等价替代，也不承诺最优分配或任意场景都能找到可执行方案；实际地图、狭窄通道及路线跟踪仍需专项验收。
+```json
+{
+  "protocol_version": 1,
+  "route_name": "sw101-摘要-r1-X30-A",
+  "execution_id": "本次路线启动的唯一值",
+  "snapshot_sequence": 2,
+  "route_state": "COMPLETED",
+  "finalized": true,
+  "reached_waypoint_ids": [1],
+  "skipped_waypoints": [{"waypoint_id": 2, "reason": "ABORTED timeout"}],
+  "pending_waypoint_ids": []
+}
+```
 
-新规划器尚未覆盖旧版全部功能，尤其是 CBS／时间预约协调、优化均衡、ROOT 空间跨图多机冲突及图形导出。当前拒绝多设备涉及多个地图的执行计划，单设备跨图仍支持。详细差异和实时性边界见 [规划器 README](../swarm_mission_planner/README.md)。规划计算在独立进程中运行，默认 45 秒回收；应短于协调器 60 秒规划期限，并为通信和提交留余量。这不构成开发板实时性能保证。
+三类清单互斥并覆盖全部航点，同次执行序号递增，到达记录不能倒退。封存后不可变。Agent 使用映射转换为业务 ID，通过持久化 outbox 重发至多数派提交 ACK。终态后最多核对十秒，缺失结果保留 UNKNOWN。导航到达是完成判据，挂载操作结果不参与补执行判定。
 
-## 平台、图片和报告
+## 平台输出
 
-外层保留 bid／tid／method／data，按 `mission.events`、`goal.events` 和 `services_reply` 区分用途。终态发送 `for_platform_mission_finished` 及同结论的大写终态。稳定 `event_id` 允许接管后重放；前端需去重。MQTT 入队／PUBACK 不表示前端已展示。本开发版本新增轮次及提交字段，尚未接入真实前后端验收，不能宣称与旧前端完全兼容。
+外层包含 bid、tid、timestamp、method 和 data。事件带稳定 event_id、round_epoch、term、commit_index 和 plan_revision，平台按 event_id 去重。
 
-已删除的 `for_platform_reallocation_tasks`、`for_platform_unassignable_tasks` 不生成。具体开发协议见 [PROTOCOL.md](PROTOCOL.md)。
-
-可选 `storage` 沿用 bucket／endpoint／objectKeyPrefix／stsCredentials。终态返回 `<objectKeyPrefix>/<bid>.html`；本地报告保留，生成及上传均在后台。上传最多四次，间隔 5、15、30 秒。凭据只存权限受限的 private 文件，不进入共识日志或报告。条件 PUT 防止旧轮／旧终态覆盖新版；同终态更新只能增加图片证据，不允许较少图片覆盖较多图片。
-
-图片按完整路线名、revision、会话及原始任务映射归属，不按坐标猜测。配置 `coordinator.media_roots` 明确允许读取的本地图片目录，`agent_data_root` 由统一新入口自动设置；独立运行节点时需手动设置。文件在后台转换为 JPEG，单张不超过 512 KiB，每轮最多 200 张，通过独立 MQTT 图片连接同步。默认不读取任何图片目录、不下载 HTTP URL；当前接入 TaskHub 的 `photo.complete`，算法远程 URL 和视频保留在 TaskHub 原报告流程，尚未统一导入本报告。
-
-HTML 图片内嵌。最近八轮历史模型用于迟到图片补充和原 key 更新，不把旧照片归入新轮；缺图不改变任务结论。生产 MinIO 必须支持所需 HEAD／GET 和条件 PUT，已有无版本对象拒绝覆盖；实际权限及条件写入需另行验证。
-
-可阅读本地生成的 [成功报告](examples/completed.html)、[补执行后部分失败报告](examples/partial-failed.html)，以及配套的 [成功事件](examples/completed-events.json)／[失败事件](examples/partial-failed-events.json)。这些是模拟业务样例，不是现场记录。
-
-## 运维与当前边界
-
-默认数据根目录 `~/.ros/swarm/<robot_id>/`，共识、Agent、协调器和传输分别持有进程锁。原生 ROS 日志存入该设备数据目录的 `ros_logs`；协调器保留共识派生状态、报告、上传任务、图片及请求记录。
-
-六个包不会各自在源码目录生成一套 `runtime/` 和 `reports/`。统一 Bringup 和各节点独立启动的默认目录均按设备隔离；显式指定节点 `data_root` 时使用该目录本身，Bringup 的 `cooperation.swarm.data_root` 则由 launch 追加设备名和组件名。
-
-| 默认目录（位于 `~/.ros/swarm/<robot_id>/`） | 内容 |
+| 事件 | 内容 |
 | --- | --- |
-| `consensus/` | term／投票／复制日志、启动绑定和锁 |
-| `agent/` | 执行围栏、YAML、结果 outbox 和路线归档 |
-| `coordinator/` | 私有请求、历史模型、图片、报告上传状态 |
-| `coordinator/reports/round-<epoch>/` | HTML 报告和本轮上传凭据／快照 |
-| `transport/` | 本机进程锁 |
-| `ros_logs/` | 统一入口设置的各节点原生 ROS 日志 |
+| services_reply | _result 为 0 表示已受理，失败包含 _error |
+| goal.events / accepted | 首发请求已提交 |
+| mission.events / for_platform_task_plan | 路线及原始 task_ids |
+| mission.events / for_platform_tasks_added | 新增 task_ids |
+| mission.events / pause_task | 暂停并准备重分配 |
+| mission.events / for_platform_skipped_tasks | 整轮最终补执行的 skipped_tasks[].task_id |
+| mission.events / device_isolated | 设备隔离 |
+| mission.events / for_platform_mission_finished | 统一终态摘要 |
+| mission.events / COMPLETED、FAILED、CANCELLED | 配套终态事件 |
 
-Planner 是无持久业务状态的计算节点，Protocol 是公共库；两者不自动创建数据或报告目录。源码内仅协调器的 `/runtime/` 用于本地集成证据并被 Git 忽略。各包 `.gitignore` 只忽略 Python 缓存、pytest 缓存及 setuptools 元数据；已移除没有实际用途的源码 `reports/` 和其余包 `runtime/` 规则。不要把真实凭据写入版本化配置，也不要将 `data_root` 指向受版本控制的源码目录。
+状态包含地图路径、到达计数、completed_task_ids、跳点及结果未知清单。设备心跳包含位姿、能力、TaskHub 状态、共识角色、任期及提交水位。终态有 storage 时包含 report_key。完成点数依据导航到达，不代表挂载操作全部成功。
+
+Leader 每两秒发送常规心跳和任务状态。新提交事件增量发送，接管时以及每 30 秒重发已有事件以补偿丢失，保持原 event_id。for_platform_reallocation_tasks 和 for_platform_unassignable_tasks 已取消。MQTT 入队或 PUBACK 不代表平台已经显示。
+
+## 图片与报告
+
+storage 包含 bucket、endpoint、objectKeyPrefix 和 stsCredentials。终态返回 <objectKeyPrefix>/<bid>.html，本地 HTML 生成和上传均在后台。只有当前具有多数派权限的 Leader 可上传，最多尝试四次，间隔 5、15、30 秒。
+
+图片按轮次、修订、路线、会话及任务映射归属，HTML 内嵌 JPEG。coordinator.media_roots 指定本机可读取目录。单张图片最多 512 KiB，每轮最多 200 张。设备间通过原有独立图片连接补同步，空图片清单不发送。源设备从未复制的图片在永久离线后无法恢复。
+
+最近八轮可接收迟到图片并更新原 key。上传使用版本元数据及条件 PUT，旧版本或图片较少的同终态报告不能覆盖更完整对象。凭据只保存在 runtime/coordinator/private_uploads。STS 不自动刷新，上传失败保留本地报告和任务结论。
+
+平台和调试台凭存储权限读取 report_key 对应对象。调试台使用独立只读账号，通过 MinIO 下载 HTML。 [调试台说明](../swarm_dev_console/README.md)
+
+## 运行资料与迁移
+
+Bringup 通过 cooperation.swarm.data_root 配置单个板端运行目录，默认位于 ~/Workspace/cooperation_ws/src/swarm_mission_coordinator/runtime。独立节点默认位于 ~/.ros/swarm/<robot_id>/runtime，相邻 reports 存放 HTML。
+
+| 路径 | 内容 |
+| --- | --- |
+| coordinator/ | 请求、提交审计、规划、图片、历史模型及私有上传任务 |
+| agent/ | TaskHub YAML、航点映射、结果 outbox 和执行记录 |
+| consensus/ | 任期、投票和复制日志 |
+| transport/ | 连接及发送摘要 |
+| ros_logs/ | ROS 节点输出与 launch.log |
+
+结构化审计按轮次、修订分段。队列溢出或磁盘写入失败会打印丢失计数。资料由维护者手工归档。
 
 ```bash
 ros2 run swarm_mission_coordinator swarm_collect_evidence \
-  ~/.ros/swarm/X30-A /tmp/X30-A-evidence.tar.gz
+  ~/Workspace/cooperation_ws/src/swarm_mission_coordinator/runtime \
+  /tmp/swarm-evidence.tar.gz --round 101
 ```
 
-导出会排除凭据和 private 请求文件，但仍包含位置、任务和图片等业务数据。不要删除活动共识、outbox、执行记录以“修复”故障；全队恢复须确认停止并使用新 epoch。
+导出包包含文件摘要、时间区间、地图摘要及缺失项，排除凭据和活动恢复文件。各设备分别导出同一轮次，可在调试台合并查看。
 
-本版共识由新系列独立实现，已做故障模拟，不构成形式化验证。快照目前保留全量已提交历史，只压缩复制尾部；单消息 8 MiB 上限、历史留存、磁盘上限和长时性能仍需工程化验收。图片自动补同步最近八轮，历史磁盘资料不自动删除。
+旧版分散目录先停任务及协同进程，再运行迁移预检。参数仅填写实际存在的源目录。
 
-远程 Broker 默认要求 TLS；Broker 必须按设备限制 sender 主题发布权限。该系统按可信设备故障模型设计，不防御被攻陷设备伪造业务。ROS 域和本机控制接口也需要部署层隔离。
+```bash
+ros2 run swarm_mission_coordinator swarm_migrate_runtime \
+  --runtime swarm_mission_coordinator/runtime \
+  --coordinator swarm_mission_coordinator/runtime \
+  --agent swarm_execution_agent/runtime \
+  --consensus swarm_consensus/runtime \
+  --transport swarm_mqtt_transport/runtime
+```
+
+确认后为同一命令增加 --apply。迁移逐文件校验并生成 migration.json，目标路径重合时保留 runtime-before-*。回滚须恢复匹配版本及状态，旧任期不得覆盖升级后已推进的任期。

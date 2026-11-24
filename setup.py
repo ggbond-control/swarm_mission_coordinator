@@ -1,5 +1,3 @@
-from glob import glob
-
 from setuptools import setup
 
 name = "swarm_mission_coordinator"
@@ -11,11 +9,7 @@ setup(
         ("share/ament_index/resource_index/packages", ["resource/" + name]),
         (
             "share/" + name,
-            ["package.xml", "README.md", "TEST_LOG.md"] + glob("PROTOCOL.md"),
-        ),
-        (
-            "share/" + name + "/examples",
-            glob("examples/*.html") + glob("examples/*.json"),
+            ["package.xml", "README.md", "TEST_LOG.md"],
         ),
     ],
     install_requires=["setuptools"],
@@ -24,6 +18,7 @@ setup(
         "console_scripts": [
             "swarm_mission_coordinator_node = swarm_mission_coordinator.node:main",
             "swarm_collect_evidence = swarm_mission_coordinator.evidence:main",
+            "swarm_migrate_runtime = swarm_mission_coordinator.runtime_migration:main",
             "swarm_prepare_demo = swarm_mission_coordinator.demo:main",
         ]
     },

@@ -2,26 +2,22 @@
 
 from __future__ import annotations
 
-import copy
-import json
+from concurrent.futures import ThreadPoolExecutor
+from importlib.metadata import PackageNotFoundError, version
+import os
 import queue
+import re
+import sys
 import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor
-from pathlib import Path
 
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile
 from std_msgs.msg import String
 from std_srvs.srv import Trigger
-from swarm_mission_planner.maps import MapBundle
-from swarm_protocol.contracts import (
-    TERMINAL,
-    decode,
-    digest,
-    normalize_mission,
-    public_mission,
-)
+from swarm_mission_planner.planner import map_fingerprint
+from swarm_protocol.audit import Audit
+from swarm_protocol.contracts import decode
 from swarm_protocol.ros import main_node, publish, runtime_path
 from swarm_protocol.storage import ProcessLock, atomic_json
 from swarm_protocol.topics import DEFAULT_CLUSTER_ID
@@ -30,10 +26,10 @@ from inspection_interfaces.msg import PlatformEvent
 
 from .api import MissionActions
 from .coordinator import Coordinator
-from .media import MediaStore
-from .model import MissionState
+from .ingress import MissionIngress
+from .mission_evidence import MissionEvidence
+from .permits import ExecutionPermits
 from .platform import snapshot_events
-from .reporting import ReportWorker
 
 
 class CoordinatorNode(Node):
@@ -52,6 +48,8 @@ class CoordinatorNode(Node):
             self.declare_parameter(key, value)
         self.declare_parameter("media_roots", [""])
         self.declare_parameter("agent_data_root", "")
+        self.declare_parameter("report_root", "")
+        self.declare_parameter("runtime_info_path", "")
         self.robot, self.cluster = (
             self.get_parameter("robot_id").value,
             self.get_parameter("cluster_id").value,
@@ -59,6 +57,16 @@ class CoordinatorNode(Node):
         self.root = runtime_path(self, "coordinator")
         self.lock = ProcessLock(self.root / "process.lock")
         self.boot, self.sequence = uuid.uuid4().hex, 0
+        info = self.get_parameter("runtime_info_path").value
+        if info:
+            software = {"python": sys.version.split()[0], "ros_distro": os.environ.get("ROS_DISTRO", "")}
+            for package in ("swarm_protocol", "swarm_consensus", "swarm_mission_planner", "swarm_mission_coordinator",
+                            "swarm_execution_agent", "swarm_mqtt_transport"):
+                try:
+                    software[package] = version(package)
+                except PackageNotFoundError:
+                    software[package] = "unknown"
+            atomic_json(info, {"robot_id": self.robot, "software": software, "coordinator_boot": self.boot})
         self.outputs = {
             name: self.create_publisher(String, topic, 100)
             for name, topic in {
@@ -66,6 +74,7 @@ class CoordinatorNode(Node):
                 "proposal": "/swarm/consensus/propose",
                 "raft_in": "/swarm/consensus/inbound",
                 "read": "/swarm/consensus/read",
+                "fetch": "/swarm/consensus/fetch",
                 "wire": "/swarm/network/outbound",
                 "platform": "/swarm/platform/outbound",
                 "planner": "/swarm/planner/request",
@@ -91,57 +100,50 @@ class CoordinatorNode(Node):
             stale_timeout=self.get_parameter("stale_timeout").value,
         )
         self.agent_state = {}
-        self.pending_request, self.credentials = None, {}
         self.fingerprint, self.map_error, self.map_working = "", "", False
-        self.read_requests = {}
-        self.grants = {}
-        self.media = MediaStore(
-            self.root / "media", self.get_parameter("media_roots").value or []
+        self.last_fetch = 0.0
+        self.consensus_received = -float("inf")
+        report_root = self.get_parameter("report_root").value
+        if not report_root:
+            report_root = self.root / "reports" if self.get_parameter("data_root").value else self.root.parent.parent / "reports"
+        self.evidence = MissionEvidence(
+            self.root, report_root,
+            self.get_parameter("agent_data_root").value, self.get_parameter("media_roots").value or [],
+            self.robot, self.core, self.wire, self.get_logger(),
+            authority=self.report_authority,
         )
-        self.history = {}
-        for path in sorted((self.root / "history").glob("*.json")):
-            try:
-                historical = MissionState(**json.loads(path.read_text()))
-                self.history[historical.epoch] = historical
-            except (OSError, ValueError, TypeError):
-                self.get_logger().warning("历史报告状态不可读，保留文件：" + str(path))
-        self.media_manifests = {}
-        self.media_serving = []
-        self.last_media, self.last_manifest = 0.0, 0.0
-        self.agent_root = self.get_parameter("agent_data_root").value
+        self.permits = ExecutionPermits(self.core, self.robot, self.pub, self.wire)
         self.create_subscription(
-            PlatformEvent, "/platform/action_events", self.photo_event, 100
+            PlatformEvent, "/platform/action_events", self.evidence.photo_event, 100
         )
-        self.report_worker = ReportWorker(self.root / "reports", self.get_logger())
         self.pool = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="swarm-preflight"
         )
         self.completed = queue.SimpleQueue()
-        self.last_hello, self.last_platform, self.last_event_log = 0.0, 0.0, 0
-        self.report_error = ""
+        self.last_hello, self.last_platform = 0.0, 0.0
+        self.last_event_log = (0, 0)
+        self.last_plan_metrics = {}
+        self.audit = Audit(self.root, self.robot, self.get_logger())
         self.request_seen = set()
-        self.relay = {}
-        self.last_relay = 0.0
-        self.commands_path = self.root / "private_commands.json"
-        self.command_outbox = (
-            json.loads(self.commands_path.read_text())
-            if self.commands_path.exists()
-            else {}
+        self.platform_cursor = (0, 0, 0)
+        self.last_platform_replay = -float("inf")
+        self.ingress = MissionIngress(
+            self.root, self.robot, self.core, pub=self.pub, wire=self.wire,
+            emit_platform=self.emit_platform, record=self.record,
+            save_storage=self.evidence.save_storage, archive_terminal=self.evidence.archive_terminal,
+            agent_state=lambda: self.agent_state, reset_preflight=self.reset_preflight,
         )
-        pending_path = self.root / "private_request.json"
-        if pending_path.exists():
-            self.pending_request = json.loads(pending_path.read_text())
-            self.restore_ingress(self.pending_request)
         for topic, callback in [
-            ("/swarm/platform/inbound", self.platform_request),
+            ("/swarm/platform/inbound", self.ingress.platform_request),
             ("/swarm/network/inbound", self.network),
             ("/swarm/consensus/outbound", self.raft_out),
             ("/swarm/consensus/state", self.consensus),
-            ("/swarm/consensus/read_confirmed", self.read_confirmed),
+            ("/swarm/consensus/entries", self.committed_entries),
+            ("/swarm/consensus/read_confirmed", self.permits.read_confirmed),
             ("/swarm/agent/state", self.agent_hello),
             ("/swarm/agent/events", self.agent_event),
-            ("/swarm/agent/permit_request", self.permit_request),
-            ("/swarm/planner/result", self.core.receive_plan),
+            ("/swarm/agent/permit_request", self.permits.permit_request),
+            ("/swarm/planner/result", self.planner_result),
         ]:
             self.create_subscription(
                 String, topic, lambda msg, cb=callback: self.safe(cb, msg), 100
@@ -151,8 +153,37 @@ class CoordinatorNode(Node):
         self.actions = MissionActions(self)
         self.create_timer(0.1, self.tick)
 
+    def record(self, kind, value):
+        model, consensus = self.core.model, self.core.consensus
+        pending = self.core.ingress[0] if self.core.ingress else {}
+        epoch = model.epoch or pending.get("round_epoch", 0)
+        revision = model.revision
+        plan_id = value.get("request_id", "")
+        if kind in {"planner", "planner_result"} and isinstance(plan_id, str):
+            match = re.match(r"^(\d+)-r(\d+)-", plan_id)
+            if match:
+                epoch, revision = map(int, match.groups())
+        self.audit.record(kind, value, epoch=epoch, revision=revision,
+                          term=consensus.get("term", 0), commit_index=model.last_index,
+                          request_id=value.get("request_id") or (
+                              f"sw{epoch}-r{revision}" if epoch else ""))
+
+    def planner_result(self, value):
+        # Late results still go through the coordinator's request fence.
+        if self.core.plan_request and value.get("request_id") == self.core.plan_request:
+            self.last_plan_metrics = {
+                **value.get("metrics", {}),
+                "request_id": value["request_id"],
+                "round_epoch": self.core.model.epoch,
+                "revision": self.core.model.revision,
+            }
+        self.record("planner_result", value)
+        self.core.receive_plan(value)
+
     def pub(self, name, value):
         publish(self.outputs[name], value)
+        if name in {"planner", "decision", "ack"}:
+            self.record(name, value)
 
     def safe(self, callback, message):
         try:
@@ -170,152 +201,6 @@ class CoordinatorNode(Node):
                 {"to": destination, "kind": kind, "data": data, "round_epoch": epoch},
             )
 
-    def restore_ingress(self, envelope):
-        mission = normalize_mission(envelope["data"], envelope["bid"])
-        if self.robot not in mission["robot_ids"]:
-            return
-        if "storage" in mission:
-            self.credentials[mission["round_epoch"]] = mission["storage"]
-        key = (
-            mission["storage"]["objectKeyPrefix"]
-            + "/"
-            + mission["mission_id"]
-            + ".html"
-            if "storage" in mission
-            else ""
-        )
-        self.core.ingress = (
-            public_mission(mission),
-            {"bid": envelope["bid"], "tid": envelope.get("tid", "")},
-            key,
-        )
-
-    def platform_request(self, envelope):
-        try:
-            self.accept_request(envelope)
-        except (ValueError, KeyError, TypeError) as error:
-            self.emit_platform(
-                "services_reply",
-                {
-                    "bid": envelope.get("bid", ""),
-                    "tid": envelope.get("tid", ""),
-                    "method": envelope.get("method", ""),
-                    "timestamp": int(time.time() * 1000),
-                    "_result": 1,
-                    "_error": str(error),
-                    "data": {"message": str(error), "robot_id": self.robot},
-                },
-            )
-            raise
-
-    def request_control(self, method):
-        pending = self.pending_request
-        if pending and pending["data"]["round_epoch"] > self.core.model.epoch:
-            bid, epoch = pending["bid"], pending["data"]["round_epoch"]
-        else:
-            bid, epoch = (
-                self.core.model.mission.get("mission_id", ""),
-                self.core.model.epoch,
-            )
-        envelope = {
-            "method": method,
-            "bid": bid,
-            "tid": uuid.uuid4().hex,
-            "data": {"round_epoch": epoch},
-        }
-        self.accept_request(envelope)
-        self.pub("decision", {"robot_id": self.robot, "command": "CANCEL"})
-
-    def accept_request(self, envelope, relay=False):
-        method = envelope.get("method")
-        if method in {"task.stop", "task.reset"}:
-            pending = self.pending_request
-            if pending and pending["data"]["round_epoch"] > self.core.model.epoch:
-                bid, epoch = pending["bid"], pending["data"]["round_epoch"]
-            elif self.core.model.mission:
-                bid, epoch = (
-                    self.core.model.mission["mission_id"],
-                    self.core.model.epoch,
-                )
-            else:
-                return
-            if envelope.get("bid") not in {None, "", bid}:
-                raise ValueError("stop/reset mission_id mismatch")
-            if envelope.get("data", {}).get("round_epoch", epoch) != epoch:
-                raise ValueError("stop/reset belongs to another round")
-            envelope = copy.deepcopy(envelope)
-            envelope.setdefault("data", {})["round_epoch"] = epoch
-            self.enqueue_request(envelope)
-            self.pub("decision", {"robot_id": self.robot, "command": "CANCEL"})
-            return
-        if method == "task.add":
-            data = envelope["data"]
-            m = self.core.model
-            if envelope.get("bid") != m.mission.get("mission_id"):
-                raise ValueError("addition mission_id mismatch")
-            if (
-                data.get("round_epoch") != m.epoch
-                or set(data.get("robot_ids", [])) != set(m.mission.get("robot_ids", []))
-                or data.get("map_package") != m.mission.get("map_package")
-            ):
-                raise ValueError("addition changes round, roster or map")
-            from swarm_protocol.contracts import normalize_task
-
-            tasks = [normalize_task(t) for t in data["tasks"]]
-            if m.state not in {"ACTIVE", "PLANNED", "PAUSING"}:
-                raise ValueError("addition not allowed in current stage")
-            identity = digest(
-                {
-                    "epoch": m.epoch,
-                    "request": {**envelope, "data": {**data, "tasks": tasks}},
-                }
-            )
-            if identity in m.applied:
-                return
-            if any(t["id"] in m.tasks for t in tasks) or len(
-                {t["id"] for t in tasks}
-            ) != len(tasks):
-                raise ValueError("duplicate added task ids")
-            self.enqueue_request({**envelope, "data": {**data, "tasks": tasks}})
-            return
-        if method != "task.execute":
-            raise ValueError("unsupported platform method")
-        mission = normalize_mission(envelope.get("data"), envelope.get("bid"))
-        if self.robot not in mission["robot_ids"]:
-            return
-        if relay:
-            self.relay[digest(envelope)] = (
-                copy.deepcopy(envelope),
-                time.monotonic() + 120.0,
-            )
-        current_epoch = self.core.consensus.get("round_epoch", 0)
-        current = self.core.model
-        if mission["round_epoch"] < current_epoch:
-            raise ValueError("old platform round")
-        if (
-            self.pending_request
-            and mission["round_epoch"] == self.pending_request["data"]["round_epoch"]
-        ):
-            previous = normalize_mission(
-                self.pending_request["data"], self.pending_request["bid"]
-            )
-            if digest(public_mission(previous)) != digest(public_mission(mission)):
-                raise ValueError("conflicting payload at same round_epoch")
-            return
-        if current.state not in TERMINAL | {"EMPTY"}:
-            raise ValueError("active round cannot be replaced")
-        if self.agent_state.get("start_phase") in {"starting", "started"}:
-            raise ValueError("local previous execution not stopped")
-        self.archive_terminal()
-        self.pending_request = copy.deepcopy(envelope)
-        atomic_json(self.root / "private_request.json", envelope)
-        self.restore_ingress(envelope)
-        self.fingerprint, self.map_error = "", ""
-        self.pub(
-            "configure",
-            {"round_epoch": mission["round_epoch"], "robot_ids": mission["robot_ids"]},
-        )
-
     def raft_out(self, value):
         self.wire(value["to"], "raft", value["data"])
 
@@ -329,7 +214,8 @@ class CoordinatorNode(Node):
             roster = value.get("data", {}).get("robot_ids", [])
             if sender not in roster or self.robot not in roster:
                 raise ValueError("round input source is not in roster")
-            self.accept_request(value)
+            self.record("peer_round_input", value)
+            self.ingress.accept_request(value)
         elif kind == "request":
             allowed = (
                 self.core.model.mission.get("robot_ids", [])
@@ -338,42 +224,10 @@ class CoordinatorNode(Node):
             )
             if sender not in allowed:
                 raise ValueError("control source is not a current member")
-            self.accept_request(value)
+            self.record("peer_control", value)
+            self.ingress.accept_request(value)
         elif kind in {"media_manifest", "media_get", "media_blob"}:
-            if kind == "media_manifest":
-                if (
-                    isinstance(value.get("records"), list)
-                    and len(value["records"]) <= 200
-                ):
-                    for record in value["records"]:
-                        historical = self.evidence_model(record.get("round_epoch"))
-                        if (
-                            historical
-                            and sender in historical.sessions
-                            and MediaStore.expected(historical, record)
-                            and record["id"] not in self.media.records
-                            and len(self.media_manifests) < 1800
-                        ):
-                            self.media_manifests[record["id"]] = (sender, record)
-            elif kind == "media_get":
-                identity = value.get("id")
-                record = self.media.records.get(identity)
-                historical = self.evidence_model((record or {}).get("round_epoch"))
-                if (
-                    historical
-                    and sender in historical.sessions
-                    and record
-                    and MediaStore.expected(historical, record)
-                    and len(self.media_serving) < 32
-                ):
-                    if (sender, identity) not in self.media_serving:
-                        self.media_serving.append((sender, identity))
-            elif kind == "media_blob":
-                historical = self.evidence_model(value["record"].get("round_epoch"))
-                if not historical or sender not in historical.sessions:
-                    return
-                self.media.receive(historical, value["record"], value["content"])
-                self.media_manifests.pop(value["record"]["id"], None)
+            self.evidence.receive_media(sender, kind, value)
         elif kind == "raft":
             if value.get("sender") != sender:
                 raise ValueError("Raft source identity mismatch")
@@ -391,55 +245,42 @@ class CoordinatorNode(Node):
             if sender != self.core.consensus.get("leader_id"):
                 return
             self.pub("ack", value)
-        elif kind == "permit_request":
-            m = self.core.model
-            if (
-                not self.core.authority()
-                or value.get("robot_id") != sender
-                or sender not in m.members
-                or sender not in m.started
-                or m.state != "ACTIVE"
-                or sender in m.stopped
-                or value.get("session_id") != m.sessions[sender]["session_id"]
-                or value.get("round_epoch") != m.epoch
-                or value.get("revision") != m.revision
-                or value.get("route_name") != m.route_name(sender)
-            ):
-                return
-            self.read_requests[value["request_id"]] = (
-                copy.deepcopy(value),
-                time.monotonic(),
-            )
-            self.pub("read", {"request_id": value["request_id"]})
-        elif kind == "permit_grant":
-            self.grants[value["request_id"]] = (sender, value, time.monotonic())
+        elif kind in {"permit_request", "permit_grant"}:
+            self.permits.receive(sender, kind, value)
         else:
             raise ValueError("unsupported peer message")
+
+    def report_authority(self):
+        return self.core.authority() and time.monotonic() - self.consensus_received < 0.5
 
     def consensus(self, value):
         try:
             if value["round_epoch"] != self.core.consensus.get("round_epoch"):
-                self.archive_terminal()
-                self.last_event_log = 0
+                self.evidence.archive_terminal()
+                self.last_event_log = (0, 0)
             self.core.receive_consensus(value)
+            self.consensus_received = time.monotonic()
         except Exception as error:
             self.core.error = str(error)
             self.pub("decision", {"command": "CANCEL", "robot_id": self.robot})
             raise
 
-    def read_confirmed(self, proof):
-        item = self.read_requests.pop(proof["request_id"], None)
-        if (
-            item
-            and self.core.authority()
-            and proof["term"] == self.core.consensus["term"]
-        ):
-            value, _ = item
-            self.wire(
-                value["robot_id"],
-                "permit_grant",
-                {**value, "term": proof["term"], "commit_index": proof["commit_index"]},
-            )
+    def committed_entries(self, value):
+        try:
+            if self.core.receive_entries(value):
+                self.last_fetch = 0.0
+        except Exception as error:
+            self.core.error = str(error)
+            self.pub("decision", {"command": "CANCEL", "robot_id": self.robot})
+            raise
+
+    def fetch_committed(self, now):
+        consensus = self.core.consensus
+        after = self.core.model.last_index
+        if after < consensus.get("commit_index", 0) and now - self.last_fetch >= 0.2:
+            self.last_fetch = now
+            self.pub("fetch", {"round_epoch": consensus["round_epoch"],
+                               "boot_id": consensus["boot_id"], "after": after})
 
     def agent_hello(self, value):
         if value["robot_id"] == self.robot:
@@ -450,11 +291,6 @@ class CoordinatorNode(Node):
         if leader:
             self.wire(leader, "agent_event", value)
 
-    def permit_request(self, value):
-        leader = self.core.consensus.get("leader_id")
-        if leader:
-            self.wire(leader, "permit_request", value)
-
     def ack(self, robot, session, event):
         value = {"session_id": session, "event_id": event}
         if robot == self.robot:
@@ -464,179 +300,13 @@ class CoordinatorNode(Node):
 
     def local_stop(self, _request, response):
         self.pub("decision", {"command": "CANCEL", "robot_id": self.robot})
-        self.request_control("task.stop")
+        self.ingress.request_control("task.stop")
         response.success = True
         response.message = "已请求本机安全停止和全局取消；全局结论须多数派提交"
         return response
 
-    def archive_terminal(self):
-        m = self.core.model
-        if m.state in TERMINAL and m.epoch and m.epoch not in self.history:
-            atomic_json(self.root / "history" / f"{m.epoch}.json", m.__dict__)
-            self.history[m.epoch] = copy.deepcopy(m)
-
-    def evidence_model(self, epoch):
-        return (
-            self.core.model
-            if epoch == self.core.model.epoch
-            else self.history.get(epoch)
-        )
-
-    def report_storage(self, epoch):
-        if epoch in self.credentials:
-            return self.credentials[epoch]
-        path = self.root / "reports" / f"round-{epoch}" / "credentials.json"
-        if path.exists():
-            self.credentials[epoch] = json.loads(path.read_text())
-        return self.credentials.get(epoch)
-
-    def control_reply(self, envelope):
-        self.emit_platform(
-            "services_reply",
-            {
-                "bid": envelope.get("bid", ""),
-                "tid": envelope.get("tid", ""),
-                "method": envelope["method"],
-                "timestamp": int(time.time() * 1000),
-                "_result": 0,
-                "data": {
-                    "round_epoch": self.core.model.epoch,
-                    "commit_index": self.core.model.last_index,
-                },
-            },
-        )
-
-    def photo_event(self, event):
-        if (
-            event.identifier not in {"photo.complete", "algorithm.result"}
-            or not self.agent_root
-        ):
-            return
-        fields = {f.identifier: f.value for f in event.output_data}
-        route = fields.get("route_name", "")
-        from swarm_protocol.contracts import identifier
-
-        try:
-            identifier(route)
-            path = (
-                Path(self.agent_root).expanduser() / "route_archive" / (route + ".json")
-            )
-            record = json.loads(path.read_text())
-            waypoint = fields.get("waypoint_id")
-            if waypoint is None and fields.get("task_id", "").isdigit():
-                waypoint = str(int(fields["task_id"]) // 100)
-            tasks = record["mapping"].get(str(waypoint))
-            if tasks is None:
-                return
-            identity = {
-                k: record[k]
-                for k in ("round_epoch", "revision", "route_name", "session_id")
-            }
-            identity.update(
-                robot_id=self.robot, task_ids=tasks, waypoint_id=str(waypoint)
-            )
-            historical = self.evidence_model(identity["round_epoch"])
-            if not historical or not MediaStore.expected(historical, identity):
-                return
-            urls = json.loads(fields.get("media_urls", "[]"))
-            if fields.get("media_url"):
-                urls.append(fields["media_url"])
-            for uri in dict.fromkeys(urls):
-                self.media.enqueue(identity, uri)
-        except (OSError, ValueError, KeyError, TypeError):
-            return
-
-    def replicate_media(self, now):
-        self.media.tick()
-        m = self.core.model
-        if not m.mission:
-            return
-        if now - self.last_manifest > 5.0:
-            for historical in [m] + sorted(
-                self.history.values(), key=lambda old: old.epoch
-            )[-8:]:
-                self.wire(
-                    "*", "media_manifest", {"records": self.media.manifest(historical)}
-                )
-            self.last_manifest = now
-        if now - self.last_media < 0.5:
-            return
-        self.last_media = now
-        if self.media_serving:
-            robot, identity = self.media_serving.pop(0)
-            record = self.media.records[identity]
-            self.wire(
-                robot,
-                "media_blob",
-                {"record": record, "content": self.media.encoded(identity)},
-            )
-        elif self.media_manifests:
-            identity, (robot, record) = next(iter(self.media_manifests.items()))
-            self.wire(robot, "media_get", {"id": identity})
-            # Rotate requests, so one missing source cannot starve others.
-            del self.media_manifests[identity]
-            self.media_manifests[identity] = (robot, record)
-
-    def enqueue_request(self, envelope):
-        identity = digest(
-            {
-                "epoch": envelope.get("data", {}).get(
-                    "round_epoch", self.core.model.epoch
-                ),
-                "request": envelope,
-            }
-        )
-        if identity in self.core.model.applied:
-            self.control_reply(envelope)
-            return
-        if identity not in self.command_outbox and len(self.command_outbox) >= 128:
-            raise ValueError("too many pending platform controls")
-        self.command_outbox[identity] = copy.deepcopy(envelope)
-        atomic_json(self.commands_path, self.command_outbox)
-
-    def forward_requests(self, now):
-        if now - self.last_relay < 1.0:
-            return
-        self.last_relay = now
-        for identity, (envelope, deadline) in list(self.relay.items()):
-            if now > deadline or envelope["data"].get(
-                "round_epoch", 0
-            ) < self.core.consensus.get("round_epoch", 0):
-                del self.relay[identity]
-                continue
-            for robot in envelope["data"].get("robot_ids", []):
-                if robot != self.robot:
-                    self.wire(robot, "round_input", envelope)
-        m = self.core.model
-        changed = False
-        for identity, envelope in list(self.command_outbox.items()):
-            epoch = envelope.get("data", {}).get("round_epoch", m.epoch)
-            if (
-                epoch != m.epoch
-                and self.pending_request
-                and epoch == self.pending_request["data"]["round_epoch"]
-            ):
-                continue  # initial consensus admission is still in progress
-            if identity in m.applied or m.state in TERMINAL or epoch != m.epoch:
-                if identity in m.applied:
-                    self.control_reply(envelope)
-                del self.command_outbox[identity]
-                changed = True
-            elif self.core.authority():
-                if envelope["method"] == "task.add":
-                    if not any(
-                        isinstance(x, dict) and x.get("request_id") == identity
-                        for x in self.core.additions
-                    ):
-                        self.core.additions.append(
-                            {"request_id": identity, "tasks": envelope["data"]["tasks"]}
-                        )
-                elif not self.core.controls:
-                    self.core.controls.append({"request_id": identity})
-            elif self.core.consensus.get("leader_id"):
-                self.wire(self.core.consensus["leader_id"], "request", envelope)
-        if changed:
-            atomic_json(self.commands_path, self.command_outbox)
+    def reset_preflight(self):
+        self.fingerprint, self.map_error = "", ""
 
     def preflight(self):
         if (
@@ -656,10 +326,10 @@ class CoordinatorNode(Node):
 
         def calculate():
             try:
-                bundle = MapBundle(
+                fingerprint = map_fingerprint(
                     mission["map_package"], radius, None if free < 0 else free
                 )
-                self.completed.put((epoch, bundle.fingerprint, ""))
+                self.completed.put((epoch, fingerprint, ""))
             except Exception as error:
                 self.completed.put((epoch, "", str(error)))
 
@@ -667,12 +337,15 @@ class CoordinatorNode(Node):
 
     def emit_platform(self, channel, payload):
         self.pub("platform", {"channel": channel, "payload": payload})
+        if channel in {"events", "services_reply"}:
+            self.record("platform_" + channel, payload)
 
     def tick(self):
         now, wall = time.monotonic(), time.time()
         try:
-            if self.pending_request:
-                data = self.pending_request["data"]
+            self.fetch_committed(now)
+            if self.ingress.pending_request:
+                data = self.ingress.pending_request["data"]
                 if data["round_epoch"] > self.core.consensus.get("round_epoch", 0):
                     self.pub(
                         "configure",
@@ -702,30 +375,8 @@ class CoordinatorNode(Node):
                 self.core.heartbeat(hello, now)
                 self.wire("*", "hello", hello)
                 self.last_hello = now
-            for key, (sender, value, at) in list(self.grants.items()):
-                c, m = self.core.consensus, self.core.model
-                if now - at > 3.0:
-                    del self.grants[key]
-                elif (
-                    sender == c.get("leader_id")
-                    and value["term"] == c.get("term")
-                    and m.last_index >= value["commit_index"]
-                    and m.state == "ACTIVE"
-                    and self.robot in m.members
-                    and self.robot not in m.stopped
-                ):
-                    self.pub("permit", value)
-                    del self.grants[key]
-            self.read_requests = {
-                k: v for k, v in self.read_requests.items() if now - v[1] < 3.0
-            }
-            try:
-                self.replicate_media(now)
-            except (ValueError, OSError, KeyError) as error:
-                self.get_logger().warning(
-                    "图片证据后台失败，不改变任务状态：" + type(error).__name__
-                )
-            self.forward_requests(now)
+            self.permits.tick(now)
+            self.ingress.forward_requests(now)
             self.core.tick(now, wall)
             self.actions.tick()
             m = self.core.model
@@ -739,13 +390,15 @@ class CoordinatorNode(Node):
             )
             publish(self.status_pub, summary)
             for event in m.events:
-                if event["index"] > self.last_event_log:
+                identity = (m.epoch, event["index"])
+                if identity > self.last_event_log:
+                    self.record("commit", event)
                     self.get_logger().info(
                         f"任务提交：epoch={m.epoch} index={event['index']} "
                         f"revision={event['revision']} type={event['kind']} state={event['state']} "
                         f"{event['message']}"
                     )
-                    self.last_event_log = event["index"]
+                    self.last_event_log = identity
             if now - self.last_platform >= 2.0:
                 self.emit_platform(
                     "heartbeat",
@@ -755,37 +408,28 @@ class CoordinatorNode(Node):
                         **self.agent_state,
                         "round_epoch": m.epoch,
                         "leader_id": self.core.consensus.get("leader_id", ""),
+                        "coordinator_boot": self.boot,
+                        "sequence": self.sequence,
+                        "term": self.core.consensus.get("term", 0),
+                        "consensus_role": self.core.consensus.get("role", ""),
+                        "authority": self.core.authority(),
+                        "voter_count": len(m.mission.get("robot_ids", [])),
+                        "quorum_required": len(m.mission["robot_ids"]) // 2 + 1 if m.mission else 0,
+                        "commit_index": self.core.consensus.get("commit_index", 0),
+                        "applied_index": m.last_index,
+                        "planner_metrics": self.last_plan_metrics
+                        if self.last_plan_metrics.get("round_epoch") == m.epoch else {},
                     },
                 )
                 if self.core.authority() and m.mission:
                     self.platform_progress(m)
                 self.last_platform = now
-            try:
-                if m.state in TERMINAL and m.terminal_index and self.core.authority():
-                    self.archive_terminal()
-                    self.report_worker.generate_async(
-                        m, self.report_storage(m.epoch), self.media
-                    )
-                    for historical in sorted(
-                        self.history.values(), key=lambda old: old.epoch
-                    )[-8:]:
-                        self.report_worker.generate_async(
-                            historical,
-                            self.report_storage(historical.epoch),
-                            self.media,
-                        )
-                self.report_worker.tick()
-                self.report_error = ""
-            except Exception as error:
-                detail = type(error).__name__
-                if detail != self.report_error:
-                    self.get_logger().error("报告后台失败，任务终态保持：" + detail)
-                    self.report_error = detail
         except Exception as error:
             self.get_logger().error(
                 f"协调器保护性暂停：{type(error).__name__}: {error}"
             )
             self.pub("decision", {"command": "CANCEL", "robot_id": self.robot})
+        self.evidence.tick(now)
 
     def platform_progress(self, m):
         summary = m.summary()
@@ -795,22 +439,29 @@ class CoordinatorNode(Node):
             "timestamp": int(time.time() * 1000),
             "type": "info",
         }
-        self.emit_platform("state", summary)
+        self.emit_platform("state", {**summary, "term": self.core.consensus.get("term", 0)})
         if m.epoch not in self.request_seen:
             self.emit_platform(
                 "services_reply", {**base, "method": "task.execute", "_result": 0}
             )
             self.request_seen.add(m.epoch)
-        # Committed facts are the durable notification source. MQTT PUBACK is
-        # not an application ACK, so replay stable event IDs on every takeover.
-        for event in snapshot_events(m, self.core.consensus["term"]):
+        # Send new facts on each update. Periodic replay repairs delivery loss
+        # without retransmitting the full route history every two seconds.
+        now = time.monotonic()
+        epoch, term, after = self.platform_cursor
+        current_term = self.core.consensus["term"]
+        if (epoch, term) != (m.epoch, current_term) or now - self.last_platform_replay >= 30.0:
+            after = 0
+            self.last_platform_replay = now
+        for event in snapshot_events(m, current_term, after=after):
             self.emit_platform("events", event)
+        self.platform_cursor = (m.epoch, current_term, m.last_index)
 
     def destroy_node(self):
+        self.audit.close()
         self.actions.close()
         self.pool.shutdown(wait=True, cancel_futures=True)
-        self.report_worker.close()
-        self.media.close()
+        self.evidence.close()
         self.lock.close()
         return super().destroy_node()
 

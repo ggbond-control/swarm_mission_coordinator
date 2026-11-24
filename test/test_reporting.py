@@ -99,6 +99,26 @@ def test_conditional_put_signing_exact_key_and_old_leader_fencing(s3):
         conditional_upload(storage, key, b"bad overwrite", 10, 22)
 
 
+def test_worker_defers_put_when_authority_is_lost_during_s3_probe(tmp_path, s3):
+    storage, _, requests = s3
+    model = terminal(tmp_path / "map")
+    model.report_key = "tmp/test/deferred.html"
+    worker = ReportWorker(tmp_path / "reports", Logger(), job_root=tmp_path / "private")
+    worker.register(model, storage)
+    try:
+        decisions = iter([True, True, True, False])
+        worker.tick(authorized=lambda: next(decisions))
+        settle(worker)
+        job = json.loads((tmp_path / "private/round-1/job.json").read_text())
+        assert job["status"] == "pending" and job["attempts"] == 0
+        assert not requests
+        worker.tick()
+        settle(worker)
+        assert len(requests) == 1
+    finally:
+        worker.close()
+
+
 class Logger:
     def __init__(self):
         self.lines = []

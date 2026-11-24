@@ -1,9 +1,9 @@
 import copy
 
 import pytest
-from support import MissionCluster, mission
-from swarm_execution_agent.execution import Execution
-from swarm_protocol.contracts import decode, digest, normalize_mission
+from support import MissionCluster
+from swarm_mission_coordinator.platform import snapshot_events
+from swarm_protocol.contracts import digest
 
 
 @pytest.mark.parametrize("count", [1, 2, 3, 4, 5])
@@ -28,10 +28,16 @@ def test_round_wide_skip_retry_exactly_once(tmp_path, recovered):
     assert c.leader().model.revision == 2
     assert c.leader().model.skip_retry_used
     assert c.leader().model.assignments["R0"]["task_ids"] == ["p1"]
+    skipped = next(
+        event["data"] for event in snapshot_events(c.leader().model, term=1)
+        if event["data"]["stage"] == "for_platform_skipped_tasks"
+    )
+    assert skipped["skipped_tasks"] == [{"task_id": "p1"}]
     c.finish_routes(skipped=set() if recovered else {"p1"})
     c.run(1)
     assert c.leader().model.state == ("COMPLETED" if recovered else "FAILED")
     assert c.leader().model.revision == 2
+    assert c.leader().model.summary()["completed_task_ids"] == (["p0", "p1"] if recovered else ["p0"])
 
 
 def test_leader_crash_preserves_arrivals_and_freezes_unconfirmed_stop(tmp_path):
@@ -90,6 +96,11 @@ def test_addition_includes_skipped_without_using_final_retry(tmp_path):
     assert model.revision == 2
     assert set(model.assignments["R0"]["task_ids"]) == {"p0", "p1", "new"}
     assert not model.skip_retry_used
+    added = next(
+        event["data"] for event in snapshot_events(model, term=1)
+        if event["data"]["stage"] == "for_platform_tasks_added"
+    )
+    assert added["task_ids"] == ["new"]
 
 
 def test_no_quorum_cannot_publish_false_terminal(tmp_path):
@@ -115,40 +126,6 @@ def test_stop_and_terminal_are_idempotent(tmp_path):
     assert c.leader().model.terminal_index == final
 
 
-@pytest.mark.parametrize(
-    "field,value",
-    [
-        ("robot_ids", []),
-        ("robot_ids", ["A", "A"]),
-        ("robot_ids", [" A"]),
-        ("robot_ids", ["a b"]),
-        ("round_epoch", 0),
-        ("round_epoch", True),
-        ("map_package", "relative"),
-        ("tasks", None),
-    ],
-)
-def test_invalid_input_rejected(tmp_path, field, value):
-    m = mission(tmp_path)
-    m[field] = value
-    with pytest.raises(ValueError):
-        normalize_mission(m, "demo")
-
-
-def test_case_sensitive_and_duplicate_json():
-    with pytest.raises(ValueError):
-        decode('{"a":1,"a":2}')
-    assert normalize_mission(
-        {
-            "round_epoch": 1,
-            "robot_ids": ["A", "a"],
-            "map_package": "/maps",
-            "tasks": [],
-        },
-        "m",
-    )["robot_ids"] == ["A", "a"]
-
-
 def test_result_cannot_be_inferred_from_progress(tmp_path):
     c = MissionCluster(tmp_path, count=1, tasks=1)
     c.run(3)
@@ -169,76 +146,6 @@ def test_result_cannot_be_inferred_from_progress(tmp_path):
     c.run(0.3)
     assert m.tasks["p0"] != "COMPLETED"
     assert c.leader().model.state == "ACTIVE"
-
-
-def test_execution_rejects_old_snapshot_and_late_permit(tmp_path):
-    m = mission(tmp_path, ["R0"], 1)
-    route = {
-        "robot_id": "R0",
-        "task_ids": ["p0"],
-        "checkpoints": [
-            {"type": "task", "task_ids": ["p0"], "location": m["tasks"][0]["location"]}
-        ],
-    }
-    a = Execution("R0", tmp_path / "agent")
-    a.prepare(
-        {
-            "session_id": a.session,
-            "round_epoch": 1,
-            "revision": 1,
-            "route_name": "route1",
-            "plan_digest": "d",
-            "route": route,
-            "mission": m,
-        }
-    )
-    request = a.request_permit(1)
-    assert not a.grant(request, 12)
-    request = a.request_permit(13)
-    assert a.grant(request, 14)
-    assert a.permit_until == 23
-    assert a.begin_start(14)
-    assert a.started(a.generation, True) == "started"
-    snapshot = {
-        "protocol_version": 1,
-        "route_name": "route1",
-        "execution_id": "e",
-        "snapshot_sequence": 1,
-        "route_state": "COMPLETED",
-        "finalized": True,
-        "reached_waypoint_ids": [1],
-        "skipped_waypoints": [],
-        "pending_waypoint_ids": [],
-    }
-    assert a.observe(snapshot)
-    assert not a.observe(snapshot)
-    with pytest.raises(ValueError):
-        a.observe({**snapshot, "execution_id": "old"})
-    assert a.outbox["result"]["result"]["reached"] == ["p0"]
-    assert not a.needs_pause(24)  # already finalized; no obsolete pause
-    assert a.request_permit(24) is None
-
-
-def test_start_late_success_requires_compensation(tmp_path):
-    a = Execution("R0", tmp_path)
-    m = mission(tmp_path / "maps", ["R0"], 0)
-    a.prepare(
-        {
-            "session_id": a.session,
-            "round_epoch": 1,
-            "revision": 1,
-            "route_name": "route1",
-            "plan_digest": "d",
-            "route": {"checkpoints": [], "task_ids": []},
-            "mission": m,
-        }
-    )
-    request = a.request_permit(0)
-    a.grant(request, 1)
-    a.begin_start(1)
-    generation = a.generation
-    assert a.needs_pause(11)
-    assert a.started(generation, True) == "cancel"
 
 
 def test_sealed_routes_satisfy_pause_without_extra_stop_rpc(tmp_path):
@@ -331,8 +238,6 @@ def test_permit_stop_wins_over_offline_reallocation(tmp_path):
 
 
 def test_platform_events_stable_and_do_not_include_removed_categories(tmp_path):
-    from swarm_mission_coordinator.platform import snapshot_events
-
     c = MissionCluster(tmp_path, count=1, tasks=1)
     c.run(3)
     c.finish_routes()
@@ -354,3 +259,62 @@ def test_platform_events_stable_and_do_not_include_removed_categories(tmp_path):
         & stages
     )
     assert all(v["bid"] == "demo" and v["tid"] == "t" for v in first)
+
+
+def test_platform_history_replays_on_takeover_and_at_bounded_interval(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from swarm_mission_coordinator.node import CoordinatorNode
+
+    cluster = MissionCluster(tmp_path, count=1, tasks=1)
+    cluster.run(3)
+    model = cluster.leader().model
+    sent = []
+    node = SimpleNamespace(
+        core=SimpleNamespace(consensus={"term": 1}), request_seen=set(),
+        platform_cursor=(0, 0, 0), last_platform_replay=-float("inf"),
+        emit_platform=lambda channel, payload: sent.append((channel, payload)),
+    )
+    clock = [100.0]
+    monkeypatch.setattr("swarm_mission_coordinator.node.time.monotonic", lambda: clock[0])
+    CoordinatorNode.platform_progress(node, model)
+    history = [event for channel, event in sent if channel == "events"]
+    assert history
+    sent.clear()
+    clock[0] += 2
+    CoordinatorNode.platform_progress(node, model)
+    assert [channel for channel, _ in sent] == ["state"]
+    cluster.finish_routes()
+    cluster.run(1)
+    sent.clear()
+    CoordinatorNode.platform_progress(node, cluster.leader().model)
+    assert {"for_platform_mission_finished", "COMPLETED"} <= {
+        event["data"]["stage"] for channel, event in sent if channel == "events"
+    }
+    for takeover in (False, True):
+        sent.clear()
+        if takeover:
+            node.core.consensus["term"] = 2
+        else:
+            clock[0] += 30
+        CoordinatorNode.platform_progress(node, cluster.leader().model)
+        assert history[0]["data"]["event_id"] in {
+            event["data"]["event_id"] for channel, event in sent if channel == "events"
+        }
+
+
+def test_dependency_needs_evidence_of_final_parking_waypoint():
+    from swarm_mission_coordinator.model import MissionState
+
+    model = MissionState()
+    model.assignments = {
+        "A": {"task_ids": ["earlier", "parking"], "dependencies": []},
+        "B": {"task_ids": ["next"], "dependencies": ["A"]},
+    }
+    model.results = {
+        "A": {"finalized": True, "state": "COMPLETED", "reached": ["earlier"],
+              "skipped": {"parking": "navigation timeout"}}
+    }
+    assert list(model.dependency_blockers("B")) == ["A"]
+    assert not model.dependencies_finished("B")
+    model.results["A"]["reached"].append("parking")
+    assert model.dependencies_finished("B")
